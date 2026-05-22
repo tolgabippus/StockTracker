@@ -20,7 +20,8 @@ END_DATE   = "2023-12-31"          # Must extend past the end of the event windo
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
-BENCHMARK = "^SXXP"               # STOXX Europe 600 — change to e.g. "^GSPC" for S&P 500
+BENCHMARK = "^STOXX50E"           # Euro STOXX 50 (yfinance-compatible); ^SXXP ist defekt auf yfinance
+# Alternativen: "^STOXX" (STOXX Europe 600), "^GDAXI" (DAX), "^GSPC" (S&P 500)
 
 # ---------------------------------------------------------------------------
 # Tickers

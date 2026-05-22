@@ -114,7 +114,7 @@ def download_all() -> pd.DataFrame:
     if not series_list:
         raise RuntimeError("All downloads failed — check your internet connection.")
 
-    df = pd.concat(series_list, axis=1)
+    df = pd.concat(series_list, axis=1, sort=True)
     df.index.name = "Date"
 
     if failed:
