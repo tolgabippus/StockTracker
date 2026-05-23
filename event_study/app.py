@@ -5,8 +5,13 @@ Start:
     streamlit run app.py
 """
 
+import sys
 from datetime import date
 from pathlib import Path
+
+import importlib
+import json
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -14,7 +19,22 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
-from data.constituents import STOXX50_TICKERS, STOXX600_TICKERS
+import data.constituents as _constituents_mod
+from data.constituents import STOXX50_TICKERS
+
+ROOT = Path(__file__).resolve().parent
+_FULL_JSON = ROOT / "data" / "stoxx600_full_tickers.json"
+
+
+def _get_stoxx600() -> list[str]:
+    """Lade STOXX600-Liste — bevorzugt die volle JSON, sonst Fallback."""
+    if _FULL_JSON.exists():
+        return json.loads(_FULL_JSON.read_text())["tickers"]
+    importlib.reload(_constituents_mod)
+    return _constituents_mod.STOXX600_TICKERS
+
+
+STOXX600_TICKERS = _get_stoxx600()
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -192,6 +212,27 @@ with st.sidebar:
                 selected_names.append(name)
 
     st.divider()
+
+    # ── STOXX 600 vollständige Liste ────────────────────────────────────────
+    if _FULL_JSON.exists():
+        _n = json.loads(_FULL_JSON.read_text()).get("count", "?")
+        st.success(f"✅ STOXX 600 vollständig: {_n} Aktien")
+    else:
+        st.warning("⚠️ STOXX 600: nur ~272 Aktien (Fallback-Liste)")
+        if st.button("🔄 Volle STOXX 600 Liste laden (iShares)", use_container_width=True):
+            with st.spinner("Hole alle 600 Konstituenten von iShares …"):
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "src" / "00_fetch_constituents.py")],
+                    capture_output=True, text=True, cwd=str(ROOT),
+                )
+            if result.returncode == 0:
+                st.success("✅ Fertig! Seite wird neu geladen …")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error("Fehler beim Laden:")
+                st.code(result.stderr[-1500:])
+
     st.caption("ETF-Proxies wo kein direkter Index verfügbar.\nDaten: Yahoo Finance / yfinance.")
 
 # ---------------------------------------------------------------------------
