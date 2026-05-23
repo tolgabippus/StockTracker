@@ -389,8 +389,8 @@ c_left, c_right = st.columns([3, 1])
 with c_left:
     idx_choice = st.radio(
         "Index",
-        ["🔵 Euro STOXX 50  (50 Aktien)",
-         "🟠 STOXX Europe 600  — Top 50 weitere Large Caps"],
+        [f"🔵 Euro STOXX 50  ({len(STOXX50_TICKERS)} Aktien)",
+         f"🟠 STOXX Europe 600  ({len(STOXX600_TICKERS)} Aktien)"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -402,8 +402,8 @@ if "STOXX 50" in idx_choice:
     const_tickers = tuple(STOXX50_TICKERS)
     section_label = "Euro STOXX 50"
 else:
-    const_tickers = tuple(STOXX600_EXTRA[:50])
-    section_label = "STOXX 600 — Top 50 weitere Large Caps"
+    const_tickers = tuple(STOXX600_TICKERS)   # alle ~250 Konstituenten
+    section_label = "STOXX Europe 600 (alle Konstituenten)"
 
 # Lazy-Load Button damit nicht jede Sidebar-Änderung 50 Aktien neu lädt
 load_key = f"loaded_{idx_choice}"
