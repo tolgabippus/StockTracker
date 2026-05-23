@@ -317,3 +317,17 @@ STOXX600_TICKERS: list[str] = STOXX50_TICKERS + [
 
 # De-duplicate (STOXX50 bereits enthalten)
 STOXX600_TICKERS = list(dict.fromkeys(STOXX600_TICKERS))
+
+# ---------------------------------------------------------------------------
+# Vollständige STOXX 600 Liste (automatisch via 00_fetch_constituents.py)
+# Falls data/stoxx600_full_tickers.json existiert, wird sie bevorzugt.
+# ---------------------------------------------------------------------------
+import json as _json
+from pathlib import Path as _Path
+
+_FULL_JSON = _Path(__file__).parent / "stoxx600_full_tickers.json"
+
+if _FULL_JSON.exists():
+    _data = _json.loads(_FULL_JSON.read_text())
+    STOXX600_TICKERS = _data["tickers"]   # überschreibt die manuelle Liste
+    _count = _data.get("count", len(STOXX600_TICKERS))
