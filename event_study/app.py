@@ -1,541 +1,335 @@
 """
-app.py — Streamlit Dashboard für das Event Study.
+app.py — Globaler Marktvergleich
 
 Start:
     streamlit run app.py
 """
 
-import subprocess
-import sys
+from datetime import date
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from scipy import stats
-
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-ROOT     = Path(__file__).resolve().parent
-PROC_DIR = ROOT / "data" / "processed"
-OUT_DIR  = ROOT / "output"
-CFG_PATH = ROOT / "config.py"
-
-sys.path.insert(0, str(ROOT))
+import yfinance as yf
 
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Event Study Dashboard",
-    page_icon="📈",
+    page_title="Marktvergleich",
+    page_icon="🌍",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-    [data-testid="stMetricValue"] { font-size: 1.6rem; }
-    [data-testid="stMetricLabel"] { font-size: 0.85rem; color: #666; }
-</style>
-""", unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# Index-Definitionen
+# ---------------------------------------------------------------------------
+INDICES: dict[str, dict] = {
+    # ── Europa ───────────────────────────────────────────────────────────────
+    "Euro STOXX 50": {
+        "ticker": "^STOXX50E",
+        "region": "Europa",
+        "note": "Index direkt",
+        "color": "#003F88",
+    },
+    "STOXX Europe 600": {
+        "ticker": "EXSA.DE",
+        "region": "Europa",
+        "note": "ETF-Proxy: iShares STOXX Europe 600 UCITS ETF",
+        "color": "#005BBB",
+    },
+    "MSCI EM Eastern Europe ex Russia": {
+        "ticker": "CE9.DE",
+        "region": "Europa",
+        "note": "ETF-Proxy: iShares MSCI Eastern Europe Capped (Russland seit Feb 2022 ausgeschlossen)",
+        "color": "#1A8FE3",
+    },
+    "STOXX Eastern Europe Large 100": {
+        "ticker": "EPOL",
+        "region": "Europa",
+        "note": "ETF-Proxy: iShares MSCI Poland ETF (größter EM-Eastern-Europe-Markt)",
+        "color": "#56C5FF",
+    },
+    "MSCI Europe Small Cap": {
+        "ticker": "IEUS",
+        "region": "Europa",
+        "note": "ETF-Proxy: iShares MSCI Europe Small-Cap ETF",
+        "color": "#A8DAFF",
+    },
+    # ── Amerika ──────────────────────────────────────────────────────────────
+    "Dow Jones Industrial": {
+        "ticker": "^DJI",
+        "region": "Amerika",
+        "note": "Index direkt",
+        "color": "#CC0000",
+    },
+    "NASDAQ Composite": {
+        "ticker": "^IXIC",
+        "region": "Amerika",
+        "note": "Index direkt",
+        "color": "#FF6B35",
+    },
+    # ── Asien ────────────────────────────────────────────────────────────────
+    "S&P Asia 50": {
+        "ticker": "AIA",
+        "region": "Asien",
+        "note": "ETF-Proxy: iShares S&P Asia 50 ETF",
+        "color": "#007A33",
+    },
+    "MSCI AC Asia": {
+        "ticker": "AAXJ",
+        "region": "Asien",
+        "note": "ETF-Proxy: iShares MSCI All Country Asia ex Japan ETF",
+        "color": "#00C04B",
+    },
+    # ── Australien ───────────────────────────────────────────────────────────
+    "MSCI Australia Large Cap": {
+        "ticker": "EWA",
+        "region": "Australien",
+        "note": "ETF-Proxy: iShares MSCI Australia ETF",
+        "color": "#E6AC00",
+    },
+}
+
+REGIONS = sorted({v["region"] for v in INDICES.values()})
+
+REGION_ICONS = {
+    "Europa":     "🇪🇺",
+    "Amerika":    "🇺🇸",
+    "Asien":      "🌏",
+    "Australien": "🇦🇺",
+}
+
+EVENT_DATE     = pd.Timestamp("2022-02-24")
+EVENT_DATE_STR = "2022-02-24"   # plotly add_vline braucht einen String
 
 
 # ---------------------------------------------------------------------------
-# Config helpers
+# Data loading
 # ---------------------------------------------------------------------------
-def load_config() -> dict:
-    """Import config.py and return all parameters as a dict."""
-    import importlib
-    import config as cfg
-    importlib.reload(cfg)
-    return {
-        "event_date":        cfg.EVENT_DATE,
-        "estimation_window": cfg.ESTIMATION_WINDOW,
-        "event_window":      cfg.EVENT_WINDOW,
-        "start_date":        cfg.START_DATE,
-        "end_date":          cfg.END_DATE,
-        "benchmark":         cfg.BENCHMARK,
-        "tickers":           cfg.TICKERS,
-        "currency":          cfg.CURRENCY,
-        "missing_strategy":  cfg.MISSING_VALUE_STRATEGY,
-    }
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_prices(tickers: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
+    """Download Adj Close prices for all tickers; skips failures silently."""
+    frames: list[pd.Series] = []
+
+    for ticker in tickers:
+        try:
+            raw = yf.download(ticker, start=start, end=end,
+                              auto_adjust=True, progress=False)
+            if raw.empty:
+                continue
+
+            if isinstance(raw.columns, pd.MultiIndex):
+                close = raw["Close"].iloc[:, 0]
+            else:
+                close = raw["Close"]
+
+            close.name = ticker
+            frames.append(close)
+        except Exception:
+            pass
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, axis=1, sort=True).ffill()
 
 
-def write_config(cfg: dict) -> None:
-    """Regenerate config.py from a dict of parameters."""
-    tickers_str = "[\n" + "".join(f'    "{t}",\n' for t in cfg["tickers"]) + "]"
-    content = f'''# config.py — auto-generated by Streamlit Dashboard
-# All study parameters live here. Never hardcode dates or tickers elsewhere.
-
-EVENT_DATE = "{cfg["event_date"]}"
-
-ESTIMATION_WINDOW = ({cfg["estimation_window"][0]}, {cfg["estimation_window"][1]})
-EVENT_WINDOW      = ({cfg["event_window"][0]},  {cfg["event_window"][1]})
-
-START_DATE = "{cfg["start_date"]}"
-END_DATE   = "{cfg["end_date"]}"
-
-BENCHMARK = "{cfg["benchmark"]}"
-
-TICKERS = {tickers_str}
-
-CURRENCY = "{cfg["currency"]}"
-MISSING_VALUE_STRATEGY = "{cfg["missing_strategy"]}"
-'''
-    CFG_PATH.write_text(content)
+def normalize(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize each column to 100 at the first non-NaN value."""
+    first = df.apply(lambda col: col.dropna().iloc[0] if col.dropna().size else np.nan)
+    return df.div(first) * 100
 
 
 # ---------------------------------------------------------------------------
-# Data loader
-# ---------------------------------------------------------------------------
-@st.cache_data(ttl=10)
-def load_results() -> dict:
-    """Load all processed CSVs. Returns only available files."""
-    data: dict = {}
-    files = {
-        "prices":  PROC_DIR / "prices_aligned.csv",
-        "returns": PROC_DIR / "returns.csv",
-        "params":  PROC_DIR / "market_model_params.csv",
-        "ar":      PROC_DIR / "abnormal_returns.csv",
-        "car":     PROC_DIR / "car.csv",
-    }
-    for key, path in files.items():
-        if not path.exists():
-            continue
-        if key in ("prices", "returns"):
-            data[key] = pd.read_csv(path, index_col="Date", parse_dates=True)
-        elif key == "params":
-            data[key] = pd.read_csv(path, index_col="ticker")
-        elif key == "ar":
-            data[key] = pd.read_csv(path, index_col="t")
-        else:
-            data[key] = pd.read_csv(path, index_col="ticker")
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Sidebar — Konfiguration & Pipeline
+# Sidebar — Controls
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.title("⚙️ Konfiguration")
+    st.title("🌍 Marktvergleich")
 
-    cfg = load_config()
-
-    # ── Ereignis ────────────────────────────────────────────
-    st.subheader("📅 Ereignis")
-    event_date = st.date_input("Event Date (T=0)",  value=pd.Timestamp(cfg["event_date"]))
-    start_date = st.date_input("Daten Start",        value=pd.Timestamp(cfg["start_date"]))
-    end_date   = st.date_input("Daten Ende",         value=pd.Timestamp(cfg["end_date"]))
-
-    # ── Fenster ─────────────────────────────────────────────
-    st.subheader("📏 Fenster (Handelstage)")
+    st.subheader("Zeitraum")
     c1, c2 = st.columns(2)
     with c1:
-        est_start = st.number_input("Schätz-Start", value=cfg["estimation_window"][0],
-                                    max_value=-2, step=1)
-        evt_start = st.number_input("Ereignis-Start", value=cfg["event_window"][0],
-                                    max_value=-1, step=1)
+        start_date = st.date_input("Von", value=date(2021, 1, 1))
     with c2:
-        est_end   = st.number_input("Schätz-Ende",  value=cfg["estimation_window"][1],
-                                    max_value=-1, step=1)
-        evt_end   = st.number_input("Ereignis-Ende", value=cfg["event_window"][1],
-                                    min_value=0, step=1)
+        end_date = st.date_input("Bis", value=date.today())
 
-    # Fenster-Overlap-Warnung
-    if est_end >= evt_start:
-        st.warning("⚠️ Schätz- und Ereignisfenster überlappen sich.")
+    st.subheader("Darstellung")
+    mode = st.radio("Kursmodus", ["Normiert (Basis 100)", "Absolut"], horizontal=True)
+    show_event = st.toggle("📍 Kriegsbeginn (24.02.2022)", value=True)
 
-    # ── Benchmark & Tickers ─────────────────────────────────
-    st.subheader("📊 Benchmark & Tickers")
-    benchmark  = st.text_input("Benchmark", value=cfg["benchmark"])
-    tickers_raw = st.text_area(
-        "Tickers (einer pro Zeile)",
-        value="\n".join(cfg["tickers"]),
-        height=170,
-    )
-    tickers  = [t.strip() for t in tickers_raw.splitlines() if t.strip()]
-    strategy = st.radio(
-        "Fehlende Handelstage",
-        ["ffill", "drop"],
-        index=0 if cfg["missing_strategy"] == "ffill" else 1,
-        horizontal=True,
-    )
+    st.subheader("Indizes")
+    selected_names: list[str] = []
+    for region in REGIONS:
+        icon = REGION_ICONS.get(region, "")
+        st.markdown(f"**{icon} {region}**")
+        for name, meta in INDICES.items():
+            if meta["region"] != region:
+                continue
+            if st.checkbox(name, value=True, key=f"cb_{name}"):
+                selected_names.append(name)
 
     st.divider()
-
-    # ── Pipeline-Buttons ────────────────────────────────────
-    run_all   = st.button("🚀 Pipeline neu starten (01–05)",
-                          type="primary", use_container_width=True)
-    run_quick = st.button("⚡ Nur 03–05 neu rechnen",
-                          use_container_width=True,
-                          help="Kursdaten bleiben unverändert — spart ~10s")
+    st.caption("ETF-Proxies wo kein direkter Index verfügbar.\nDaten: Yahoo Finance / yfinance.")
 
 # ---------------------------------------------------------------------------
-# Pipeline-Ausführung
+# Guard
 # ---------------------------------------------------------------------------
-if run_all or run_quick:
-    # 1. Config schreiben
-    write_config({
-        "event_date":        str(event_date),
-        "estimation_window": (int(est_start), int(est_end)),
-        "event_window":      (int(evt_start), int(evt_end)),
-        "start_date":        str(start_date),
-        "end_date":          str(end_date),
-        "benchmark":         benchmark,
-        "tickers":           tickers,
-        "currency":          cfg["currency"],
-        "missing_strategy":  strategy,
-    })
-
-    # 2. Skripte ausführen
-    scripts = (
-        ["01_download.py", "02_returns.py", "03_market_model.py",
-         "04_event_study.py", "05_export.py"]
-        if run_all else
-        ["03_market_model.py", "04_event_study.py", "05_export.py"]
-    )
-
-    with st.status("Pipeline läuft …", expanded=True) as status_box:
-        failed = False
-        for script in scripts:
-            st.write(f"▶ `{script}`")
-            result = subprocess.run(
-                [sys.executable, str(ROOT / "src" / script)],
-                capture_output=True, text=True, cwd=str(ROOT),
-            )
-            if result.returncode != 0:
-                st.error(f"❌ `{script}` fehlgeschlagen")
-                st.code(result.stderr[-3000:], language="text")
-                status_box.update(label="Pipeline fehlgeschlagen ❌", state="error")
-                failed = True
-                break
-            st.write(f"  ✅ abgeschlossen")
-
-        if not failed:
-            status_box.update(label="Pipeline erfolgreich abgeschlossen ✅", state="complete")
-
-    st.cache_data.clear()
-    st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# Daten laden
-# ---------------------------------------------------------------------------
-data = load_results()
-
-if not data or "car" not in data:
-    st.title("📈 Event Study Dashboard")
-    st.info(
-        "Noch keine Ergebnisse vorhanden.  \n"
-        "Klicke in der Sidebar auf **🚀 Pipeline neu starten**."
-    )
+if not selected_names:
+    st.title("🌍 Globaler Marktvergleich")
+    st.info("Bitte mindestens einen Index in der Sidebar auswählen.")
     st.stop()
 
-car    = data["car"]
-ar     = data.get("ar")
-params = data.get("params")
+# ---------------------------------------------------------------------------
+# Download
+# ---------------------------------------------------------------------------
+selected_tickers = tuple(INDICES[n]["ticker"] for n in selected_names)
 
+with st.spinner("Kursdaten werden geladen …"):
+    prices_raw = download_prices(
+        tickers=selected_tickers,
+        start=str(start_date),
+        end=str(end_date),
+    )
+
+if prices_raw.empty:
+    st.error("Keine Kursdaten geladen. Bitte Internetverbindung prüfen.")
+    st.stop()
+
+ticker_to_name = {INDICES[n]["ticker"]: n for n in selected_names}
+
+available = [
+    n for n in selected_names
+    if INDICES[n]["ticker"] in prices_raw.columns
+    and prices_raw[INDICES[n]["ticker"]].dropna().size > 10
+]
+missing = [n for n in selected_names if n not in available]
+
+prices = prices_raw[[INDICES[n]["ticker"] for n in available]].copy()
+prices.columns = [ticker_to_name[c] for c in prices.columns]
+prices = prices.loc[str(start_date):str(end_date)]
+
+plot_data = normalize(prices) if mode == "Normiert (Basis 100)" else prices
 
 # ---------------------------------------------------------------------------
-# Header
+# Chart
 # ---------------------------------------------------------------------------
-st.title("📈 Event Study Dashboard")
-
-cfg_now = load_config()
+st.title("🌍 Globaler Marktvergleich")
 st.caption(
-    f"Ereignis: **{cfg_now['event_date']}** · "
-    f"Benchmark: **{cfg_now['benchmark']}** · "
-    f"Ereignisfenster: **[{cfg_now['event_window'][0]}, {cfg_now['event_window'][1]}]** · "
-    f"Schätzfenster: **[{cfg_now['estimation_window'][0]}, {cfg_now['estimation_window'][1]}]**"
+    f"Zeitraum: **{start_date.strftime('%d.%m.%Y')}** – **{end_date.strftime('%d.%m.%Y')}** · "
+    f"Modus: **{mode}**"
 )
 
-# ---------------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------------
-tab_overview, tab_charts, tab_tables, tab_export = st.tabs(
-    ["📊 Übersicht", "📈 Charts", "📋 Tabellen", "💾 Export"]
+if missing:
+    st.warning(f"Nicht geladen (yfinance): {', '.join(missing)}")
+
+fig = go.Figure()
+
+for name in available:
+    meta  = INDICES[name]
+    y     = plot_data[name].dropna()
+    dash  = "dot" if meta["note"].startswith("ETF") else "solid"
+
+    fig.add_trace(go.Scatter(
+        x=y.index,
+        y=y.values,
+        name=name,
+        mode="lines",
+        line=dict(color=meta["color"], width=2, dash=dash),
+        hovertemplate=(
+            f"<b>{name}</b><br>%{{x|%d.%m.%Y}}<br>"
+            + ("%{y:.1f}" if mode == "Normiert (Basis 100)" else "%{y:,.0f}")
+            + "<extra></extra>"
+        ),
+    ))
+
+# War annotation — x als String übergeben (pd.Timestamp nicht kompatibel mit add_vline)
+if show_event and pd.Timestamp(start_date) <= EVENT_DATE <= pd.Timestamp(end_date):
+    fig.add_vline(
+        x=EVENT_DATE_STR,
+        line=dict(color="red", width=1.5, dash="dash"),
+        annotation=dict(
+            text="🔴 Kriegsbeginn<br>24.02.2022",
+            font=dict(size=11, color="red"),
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="red",
+            borderwidth=1,
+            xanchor="left",
+        ),
+        annotation_position="top right",
+    )
+
+fig.update_layout(
+    height=570,
+    margin=dict(l=0, r=0, t=10, b=10),
+    hovermode="x unified",
+    legend=dict(
+        orientation="h",
+        yanchor="bottom", y=1.01,
+        xanchor="left",  x=0,
+        font=dict(size=11),
+    ),
+    xaxis=dict(showgrid=True, gridcolor="#F0F0F0", tickformat="%b %Y"),
+    yaxis=dict(
+        showgrid=True,
+        gridcolor="#F0F0F0",
+        tickformat=".0f" if mode == "Normiert (Basis 100)" else ",.0f",
+        title="Basis 100" if mode == "Normiert (Basis 100)" else "Kurs",
+    ),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
 )
 
+st.plotly_chart(fig, use_container_width=True)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 1 — Übersicht
-# ═══════════════════════════════════════════════════════════════════════════
-with tab_overview:
-    cars     = car["CAR"].dropna()
-    mean_car = cars.mean()
-    n_sig    = int(car["significant_5pct"].sum())
-    n_total  = len(car)
+# ---------------------------------------------------------------------------
+# Performance-Tabelle
+# ---------------------------------------------------------------------------
+rows = []
+for name in available:
+    col = prices[name].dropna()
+    if len(col) < 2:
+        continue
 
-    if len(cars) > 1 and cars.std(ddof=1) > 0:
-        cs_t = mean_car / (cars.std(ddof=1) / np.sqrt(len(cars)))
-        cs_p = 2 * stats.t.sf(abs(cs_t), df=len(cars) - 1)
+    perf_total = col.iloc[-1] / col.iloc[0] - 1
+
+    nearest_after = col.index[col.index >= EVENT_DATE]
+    if len(nearest_after):
+        perf_war = col.iloc[-1] / col.loc[nearest_after[0]] - 1
     else:
-        cs_t = cs_p = float("nan")
+        perf_war = np.nan
 
-    # KPI-Kacheln
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Ø CAR (alle Ticker)",         f"{mean_car:+.2%}")
-    k2.metric("Signifikant bei 5%",          f"{n_sig} / {n_total}")
-    k3.metric("Cross-section. t-Statistik",  f"{cs_t:.3f}" if not np.isnan(cs_t) else "—")
-    k4.metric("p-Wert (cross-sectional)",    f"{cs_p:.4f}" if not np.isnan(cs_p) else "—")
+    rows.append({
+        "Index":                        name,
+        "Region":                       REGION_ICONS.get(INDICES[name]["region"], "") + " " + INDICES[name]["region"],
+        "Gesamt-Performance":           perf_total,
+        "Seit Kriegsbeginn (24.02.22)": perf_war,
+        "Ticker":                       INDICES[name]["ticker"],
+    })
 
-    st.divider()
-    st.subheader("Ergebnisse pro Ticker")
-
-    rows = []
-    for ticker in car.index:
-        p   = car.loc[ticker, "p_value"]
-        sig = bool(car.loc[ticker, "significant_5pct"])
-        beta = params.loc[ticker, "beta"]  if (params is not None and ticker in params.index) else np.nan
-        r2   = params.loc[ticker, "r_squared"] if (params is not None and ticker in params.index) else np.nan
-
-        rows.append({
-            "Ticker":            ticker,
-            "CAR":               car.loc[ticker, "CAR"],
-            "t-Statistik":       car.loc[ticker, "t_stat"],
-            "p-Wert":            p,
-            "Signifikant (5%)":  "✅ Ja" if sig else "❌ Nein",
-            "β (Beta)":          beta,
-            "R²":                r2,
-        })
-
-    df_display = pd.DataFrame(rows).set_index("Ticker")
-
+if rows:
+    df_perf = pd.DataFrame(rows).set_index("Index")
     st.dataframe(
-        df_display.style
+        df_perf.style
             .format({
-                "CAR":          "{:+.2%}",
-                "t-Statistik":  "{:.3f}",
-                "p-Wert":       "{:.4f}",
-                "β (Beta)":     "{:.4f}",
-                "R²":           "{:.4f}",
+                "Gesamt-Performance":           "{:+.1%}",
+                "Seit Kriegsbeginn (24.02.22)": "{:+.1%}",
             })
-            .background_gradient(subset=["CAR"], cmap="RdYlGn", vmin=-0.3, vmax=0.3),
+            .background_gradient(
+                subset=["Gesamt-Performance", "Seit Kriegsbeginn (24.02.22)"],
+                cmap="RdYlGn", vmin=-0.5, vmax=0.5,
+            ),
         use_container_width=True,
-        height=320,
+        height=38 + len(rows) * 35,
     )
 
-    # Interpretation
-    with st.expander("💡 Interpretation"):
-        st.markdown(f"""
-**Cross-sectional t-Test** (H₀: Ø CAR = 0)
-→ t = {cs_t:.3f}, p = {cs_p:.4f} — {"**Ø CAR signifikant ≠ 0**" if (not np.isnan(cs_p) and cs_p < 0.05) else "Ø CAR **nicht** signifikant von 0 verschieden"} auf 5%-Niveau.
-
-**Einzelne Ticker:**
-{n_sig} von {n_total} Aktien zeigen einen signifikanten CAR auf dem 5%-Niveau.
-
-**Hinweis:** Das Marktmodell wurde über das Schätzfenster
-[{cfg_now["estimation_window"][0]}, {cfg_now["estimation_window"][1]}] Handelstage vor T=0 kalibriert.
-Der t-Test basiert auf der Zeitreihen-Standardabweichung der ARs im Ereignisfenster (Patell-Ansatz).
-""")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 2 — Charts
-# ═══════════════════════════════════════════════════════════════════════════
-with tab_charts:
-    if ar is None:
-        st.warning("AR-Daten nicht verfügbar.")
-        st.stop()
-
-    ticker_cols = [c for c in ar.columns if c != "date"]
-
-    selected = st.multiselect(
-        "Ticker auswählen",
-        options=ticker_cols,
-        default=ticker_cols,
-    )
-
-    if not selected:
-        st.info("Bitte mindestens einen Ticker auswählen.")
-    else:
-        # ── AR-Zeitreihe ────────────────────────────────────
-        st.subheader("Abnormale Renditen (AR) pro Ereignistag")
-        fig_ar = go.Figure()
-        for ticker in selected:
-            fig_ar.add_trace(go.Scatter(
-                x=ar.index, y=ar[ticker],
-                mode="lines+markers", name=ticker,
-                marker=dict(size=5),
-                hovertemplate="%{y:.2%}",
-            ))
-        fig_ar.add_hline(y=0, line_dash="dash", line_color="black", line_width=1)
-        fig_ar.add_vline(x=0, line_dash="dot", line_color="red", line_width=2,
-                         annotation_text="T=0", annotation_position="top right")
-        fig_ar.update_layout(
-            xaxis_title="Ereignistag (t)",
-            yaxis_title="Abnormale Rendite",
-            yaxis_tickformat=".1%",
-            hovermode="x unified",
-            height=430,
-            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-        )
-        st.plotly_chart(fig_ar, use_container_width=True)
-
-        # ── CAR-Pfade ───────────────────────────────────────
-        st.subheader("Kumulative Abnormale Renditen (CAR-Pfade)")
-        cum = ar[selected].cumsum()
-        fig_car = go.Figure()
-        for ticker in selected:
-            fig_car.add_trace(go.Scatter(
-                x=cum.index, y=cum[ticker],
-                mode="lines+markers", name=ticker,
-                marker=dict(size=5),
-                hovertemplate="%{y:.2%}",
-            ))
-        fig_car.add_hline(y=0, line_dash="dash", line_color="black", line_width=1)
-        fig_car.add_vline(x=0, line_dash="dot", line_color="red", line_width=2,
-                          annotation_text="T=0", annotation_position="top right")
-        fig_car.update_layout(
-            xaxis_title="Ereignistag (t)",
-            yaxis_title="Kumulierte Abnormale Rendite",
-            yaxis_tickformat=".1%",
-            hovermode="x unified",
-            height=430,
-            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-        )
-        st.plotly_chart(fig_car, use_container_width=True)
-
-        # ── CAR-Bar & Beta-Bar ──────────────────────────────
-        col_left, col_right = st.columns(2)
-
-        with col_left:
-            st.subheader("Gesamt-CAR pro Ticker")
-            car_sel = car.loc[selected].copy()
-            colors  = ["#2ecc71" if s else "#e74c3c"
-                       for s in car_sel["significant_5pct"]]
-            fig_bar = go.Figure(go.Bar(
-                x=car_sel.index,
-                y=car_sel["CAR"],
-                marker_color=colors,
-                text=[f"{v:+.2%}" for v in car_sel["CAR"]],
-                textposition="outside",
-            ))
-            fig_bar.add_hline(y=0, line_dash="dash", line_color="black", line_width=1)
-            fig_bar.update_layout(
-                yaxis_title="CAR",
-                yaxis_tickformat=".1%",
-                height=380,
-                showlegend=False,
-                annotations=[dict(
-                    text="Grün = signifikant (5%), Rot = nicht signifikant",
-                    xref="paper", yref="paper", x=0, y=-0.15,
-                    showarrow=False, font=dict(size=10, color="#888"),
-                )],
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-
-        with col_right:
-            if params is not None:
-                st.subheader("Beta (β) & R² pro Ticker")
-                p_sel = params.loc[[t for t in selected if t in params.index]].copy()
-                fig_beta = go.Figure()
-                fig_beta.add_trace(go.Bar(
-                    x=p_sel.index,
-                    y=p_sel["beta"],
-                    name="β (Beta)",
-                    marker_color="steelblue",
-                    text=[f"{v:.3f}" for v in p_sel["beta"]],
-                    textposition="outside",
-                ))
-                fig_beta.add_trace(go.Scatter(
-                    x=p_sel.index,
-                    y=p_sel["r_squared"],
-                    name="R²",
-                    mode="markers",
-                    marker=dict(size=10, color="darkorange", symbol="diamond"),
-                    yaxis="y2",
-                ))
-                fig_beta.add_hline(y=1, line_dash="dash", line_color="red",
-                                   annotation_text="β=1")
-                fig_beta.update_layout(
-                    yaxis=dict(title="β", side="left"),
-                    yaxis2=dict(title="R²", side="right", overlaying="y",
-                                range=[0, 1], tickformat=".0%"),
-                    height=380,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.01),
-                )
-                st.plotly_chart(fig_beta, use_container_width=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 3 — Tabellen
-# ═══════════════════════════════════════════════════════════════════════════
-with tab_tables:
-    sub_mm, sub_ar, sub_car = st.tabs(
-        ["📐 Marktmodell", "📉 Abnormale Renditen", "📋 CAR & t-Tests"]
-    )
-
-    with sub_mm:
-        if params is not None:
-            st.dataframe(
-                params.style.format({
-                    "alpha":     "{:.6f}",
-                    "beta":      "{:.4f}",
-                    "r_squared": "{:.4f}",
-                    "n_obs":     "{:.0f}",
-                    "se_alpha":  "{:.6f}",
-                    "se_beta":   "{:.6f}",
-                }).background_gradient(subset=["r_squared"], cmap="Blues"),
-                use_container_width=True,
-            )
-
-    with sub_ar:
-        if ar is not None:
-            ticker_cols = [c for c in ar.columns if c != "date"]
-            st.dataframe(
-                ar[ticker_cols].style
-                    .format("{:+.4%}")
-                    .background_gradient(cmap="RdYlGn", axis=None, vmin=-0.05, vmax=0.05),
-                use_container_width=True,
-                height=500,
-            )
-
-    with sub_car:
-        if car is not None:
-            fmt = {
-                "CAR":              "{:+.4%}",
-                "t_stat":           "{:.3f}",
-                "p_value":          "{:.4f}",
-                "mean_AR":          "{:+.4%}",
-                "std_AR":           "{:.4%}",
-                "n_days":           "{:.0f}",
-            }
-            st.dataframe(
-                car.drop(columns=["significant_5pct"])
-                   .style.format(fmt)
-                   .background_gradient(subset=["CAR"], cmap="RdYlGn", vmin=-0.3, vmax=0.3),
-                use_container_width=True,
-            )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TAB 4 — Export
-# ═══════════════════════════════════════════════════════════════════════════
-with tab_export:
-    st.subheader("📥 Excel-Datei herunterladen")
-
-    xlsx_path = OUT_DIR / "results.xlsx"
-    if xlsx_path.exists():
-        mtime = pd.Timestamp(xlsx_path.stat().st_mtime, unit="s")
-        st.caption(f"Zuletzt generiert: **{mtime.strftime('%d.%m.%Y %H:%M:%S')}**")
-
-        with open(xlsx_path, "rb") as f:
-            st.download_button(
-                label="📥  results.xlsx herunterladen",
-                data=f.read(),
-                file_name="event_study_results.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                use_container_width=True,
-            )
-    else:
-        st.warning("Noch keine Excel-Datei vorhanden. Starte zuerst die Pipeline.")
-
-    st.divider()
-    st.subheader("⚙️ Aktuelle Konfiguration (config.py)")
-    cfg_display = load_config()
-    st.json(cfg_display)
+# ---------------------------------------------------------------------------
+# ETF-Proxy-Legende
+# ---------------------------------------------------------------------------
+with st.expander("ℹ️ Verwendete Ticker & ETF-Proxies"):
+    for name in available:
+        meta = INDICES[name]
+        st.markdown(f"- **{name}** → `{meta['ticker']}` — {meta['note']}")
