@@ -14,6 +14,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+from data.constituents import STOXX50_TICKERS, STOXX600_TICKERS
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -142,6 +144,23 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize each column to 100 at the first non-NaN value."""
     first = df.apply(lambda col: col.dropna().iloc[0] if col.dropna().size else np.nan)
     return df.div(first) * 100
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_constituents_batch(tickers: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
+    """Batch-Download für Einzelaktien (schneller als Einzelabruf)."""
+    try:
+        raw = yf.download(
+            list(tickers), start=start, end=end,
+            auto_adjust=True, progress=False,
+        )
+        if raw.empty:
+            return pd.DataFrame()
+        # yfinance gibt bei mehreren Tickern MultiIndex zurück: (OHLCV, Ticker)
+        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+        return close.ffill()
+    except Exception:
+        return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -355,3 +374,145 @@ with st.expander("ℹ️ Verwendete Ticker & ETF-Proxies"):
     for name in available:
         meta = INDICES[name]
         st.markdown(f"- **{name}** → `{meta['ticker']}` — {meta['note']}")
+
+# ---------------------------------------------------------------------------
+# Einzelaktien — STOXX 50 / STOXX 600
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("📊 Einzelaktien")
+
+# Ticker-Auswahl
+STOXX50_SET  = set(STOXX50_TICKERS)
+STOXX600_EXTRA = [t for t in STOXX600_TICKERS if t not in STOXX50_SET]
+
+c_left, c_right = st.columns([3, 1])
+with c_left:
+    idx_choice = st.radio(
+        "Index",
+        ["🔵 Euro STOXX 50  (50 Aktien)",
+         "🟠 STOXX Europe 600  — Top 50 weitere Large Caps"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+with c_right:
+    sort_dir = st.selectbox("Sortierung", ["Performance ↓", "Performance ↑", "A–Z"],
+                            label_visibility="collapsed")
+
+if "STOXX 50" in idx_choice:
+    const_tickers = tuple(STOXX50_TICKERS)
+    section_label = "Euro STOXX 50"
+else:
+    const_tickers = tuple(STOXX600_EXTRA[:50])
+    section_label = "STOXX 600 — Top 50 weitere Large Caps"
+
+# Lazy-Load Button damit nicht jede Sidebar-Änderung 50 Aktien neu lädt
+load_key = f"loaded_{idx_choice}"
+if load_key not in st.session_state:
+    st.session_state[load_key] = False
+
+if not st.session_state[load_key]:
+    if st.button(f"📥 {section_label} laden ({len(const_tickers)} Aktien)", type="primary"):
+        st.session_state[load_key] = True
+        st.rerun()
+    st.caption("Erster Ladevorgang dauert ca. 15–30 Sekunden. Danach gecacht (1 h).")
+else:
+    with st.spinner(f"Lade {len(const_tickers)} Aktien …"):
+        const_raw = download_constituents_batch(
+            tickers=const_tickers,
+            start=str(start_date),
+            end=str(end_date),
+        )
+
+    if const_raw.empty:
+        st.warning("Keine Kursdaten geladen — bitte Internetverbindung prüfen.")
+    else:
+        # Nur Tickers mit genug Daten behalten
+        valid = [c for c in const_raw.columns if const_raw[c].dropna().size > 10]
+        prices_c = const_raw[valid].loc[str(start_date):str(end_date)]
+
+        # Performance berechnen
+        perf_rows = []
+        for ticker in valid:
+            col = prices_c[ticker].dropna()
+            if len(col) < 2:
+                continue
+            perf_total = col.iloc[-1] / col.iloc[0] - 1
+            nearest = col.index[col.index >= EVENT_DATE]
+            perf_war = (col.iloc[-1] / col.loc[nearest[0]] - 1) if len(nearest) else np.nan
+            perf_rows.append({
+                "Ticker":                       ticker,
+                "Gesamt-Performance":           perf_total,
+                "Seit Kriegsbeginn (24.02.22)": perf_war,
+            })
+
+        if not perf_rows:
+            st.warning("Keine auswertbaren Kursdaten.")
+        else:
+            df_c = pd.DataFrame(perf_rows).set_index("Ticker")
+
+            # Sortierung
+            if sort_dir == "Performance ↓":
+                df_c = df_c.sort_values("Gesamt-Performance", ascending=False)
+            elif sort_dir == "Performance ↑":
+                df_c = df_c.sort_values("Gesamt-Performance", ascending=True)
+            else:
+                df_c = df_c.sort_index()
+
+            # ── Balkendiagramm ──────────────────────────────────────────────
+            colors = ["#2ecc71" if v >= 0 else "#e74c3c"
+                      for v in df_c["Gesamt-Performance"]]
+
+            fig_c = go.Figure(go.Bar(
+                x=df_c.index,
+                y=df_c["Gesamt-Performance"],
+                marker_color=colors,
+                text=[f"{v:+.1%}" for v in df_c["Gesamt-Performance"]],
+                textposition="outside",
+                hovertemplate="<b>%{x}</b><br>%{y:+.1%}<extra></extra>",
+            ))
+            fig_c.add_hline(y=0, line_color="black", line_width=0.8)
+            fig_c.update_layout(
+                height=420,
+                margin=dict(l=0, r=0, t=10, b=0),
+                yaxis=dict(
+                    tickformat=".0%",
+                    title="Gesamt-Performance",
+                    showgrid=True, gridcolor="#F0F0F0",
+                ),
+                xaxis=dict(showgrid=False),
+                plot_bgcolor="white",
+                paper_bgcolor="white",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_c, use_container_width=True)
+
+            # ── Tabelle ─────────────────────────────────────────────────────
+            war_ok = pd.Timestamp(end_date) >= EVENT_DATE
+            fmt = {"Gesamt-Performance": "{:+.1%}"}
+            grad_cols = ["Gesamt-Performance"]
+            if war_ok:
+                fmt["Seit Kriegsbeginn (24.02.22)"] = "{:+.1%}"
+                grad_cols.append("Seit Kriegsbeginn (24.02.22)")
+            else:
+                df_c = df_c.drop(columns=["Seit Kriegsbeginn (24.02.22)"])
+
+            st.dataframe(
+                df_c.style
+                    .format(fmt, na_rep="—")
+                    .background_gradient(
+                        subset=grad_cols, cmap="RdYlGn",
+                        vmin=-0.4, vmax=0.4,
+                    ),
+                use_container_width=True,
+                height=min(38 + len(df_c) * 35, 600),
+            )
+
+            st.caption(
+                f"✅ {len(valid)} von {len(const_tickers)} Tickern geladen · "
+                f"{section_label} · Zeitraum: {start_date} – {end_date}"
+            )
+
+            if st.button("🔄 Neu laden"):
+                st.session_state[load_key] = False
+                st.cache_data.clear()
+                st.rerun()
