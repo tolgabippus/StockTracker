@@ -621,32 +621,83 @@ else:
 
 # ── STOXX 600: vollständige Liste laden (falls noch nicht gecacht) ──
 if "STOXX 600" in idx_choice and not _FULL_JSON.exists():
-    _ba, _bb = st.columns([5, 2])
-    with _ba:
-        st.markdown(
-            "<div style='background:#FEF9C3;border:1px solid #FDE68A;border-radius:6px;"
-            "padding:0.45rem 0.85rem;font-size:0.82rem;color:#92400E'>"
-            "Fallback-Liste aktiv — nur 272 von 600 Aktien verfügbar</div>",
-            unsafe_allow_html=True,
-        )
-    with _bb:
-        if st.button("Alle 600 Aktien laden", use_container_width=True):
-            with st.spinner("Lade vollständige Konstituentenliste ..."):
-                result = subprocess.run(
-                    [sys.executable, str(ROOT / "src" / "00_fetch_constituents.py")],
-                    capture_output=True, text=True, cwd=str(ROOT),
-                )
-            if result.returncode == 0:
-                importlib.reload(_constituents_mod)
-                st.cache_data.clear()
-                st.rerun()
-            else:
-                st.error(
-                    "Automatisches Laden fehlgeschlagen — die iShares-URL ist möglicherweise "
-                    "nicht erreichbar. Bitte die Holdings-CSV manuell herunterladen unter: "
-                    "https://www.ishares.com/uk/individual/en/products/251904 "
-                    "und als `event_study/data/stoxx600_manual.csv` speichern."
-                )
+    st.markdown(
+        "<div style='background:#FEF9C3;border:1px solid #FDE68A;border-radius:8px;"
+        "padding:0.75rem 1rem;margin:0.5rem 0 0.75rem 0'>"
+        "<div style='font-size:0.85rem;font-weight:600;color:#92400E;margin-bottom:0.35rem'>"
+        "Vollständige STOXX 600 Liste nicht geladen — 272 von 600 Aktien aktiv"
+        "</div>"
+        "<div style='font-size:0.8rem;color:#78350F;line-height:1.5'>"
+        "iShares blockiert automatische Downloads. Lade die Holdings-CSV einmalig manuell herunter:<br>"
+        "<b>1.</b> Öffne "
+        "<a href='https://www.ishares.com/uk/individual/en/products/251904/' target='_blank' "
+        "style='color:#2563EB'>ishares.com → STOXX Europe 600 ETF</a><br>"
+        "<b>2.</b> Klicke auf <i>Download Holdings</i> (CSV)<br>"
+        "<b>3.</b> Lade die Datei hier hoch:"
+        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    uploaded = st.file_uploader(
+        "Holdings-CSV hochladen",
+        type=["csv"],
+        label_visibility="collapsed",
+        key="stoxx600_upload",
+    )
+    if uploaded is not None:
+        with st.spinner("Verarbeite CSV ..."):
+            try:
+                _text = uploaded.read().decode("utf-8", errors="replace")
+                _df   = None
+                for skip in (2, 1, 0):
+                    try:
+                        _tmp = pd.read_csv(io.StringIO(_text), skiprows=skip)
+                        if {"Ticker", "Exchange"}.issubset(set(_tmp.columns)):
+                            _df = _tmp
+                            break
+                    except Exception:
+                        continue
+
+                if _df is None:
+                    st.error("Datei konnte nicht geparst werden — bitte die Original-CSV von iShares verwenden.")
+                else:
+                    # Exchange → yfinance suffix mapping (gleich wie in 00_fetch_constituents.py)
+                    _SUFFIX = {
+                        "XETR": ".DE", "XFRA": ".F", "XPAR": ".PA", "XAMS": ".AS",
+                        "XLON": ".L",  "XMIL": ".MI","XMAD": ".MC","XSWX": ".SW",
+                        "XVTX": ".SW", "XSTO": ".ST","XCSE": ".CO","XHEL": ".HE",
+                        "XOSL": ".OL", "XBRU": ".BR","XWBO": ".VI","XLIS": ".LS",
+                        "XDUB": ".IR", "XWAR": ".WA","XBUD": ".BD","XPRA": ".PR",
+                        "XLUX": ".LU", "ASEX": ".AT",
+                    }
+                    tickers_parsed = []
+                    ticker_col   = next((c for c in _df.columns if "ticker"   in c.lower()), None)
+                    exchange_col = next((c for c in _df.columns if "exchange" in c.lower()), None)
+                    asset_col    = next((c for c in _df.columns if "asset"    in c.lower()
+                                        and "class" in c.lower()), None)
+
+                    for _, row in _df.iterrows():
+                        if asset_col:
+                            ac = str(row.get(asset_col, "")).strip().lower()
+                            if ac not in ("equity", "aktie", "stock"):
+                                continue
+                        raw = str(row[ticker_col]).strip()
+                        exch = str(row[exchange_col]).strip().upper()
+                        if raw and raw.lower() not in ("nan", "-", ""):
+                            suffix = _SUFFIX.get(exch, "")
+                            tickers_parsed.append((raw + suffix).upper())
+
+                    tickers_parsed = list(dict.fromkeys(tickers_parsed))
+                    _FULL_JSON.parent.mkdir(parents=True, exist_ok=True)
+                    _FULL_JSON.write_text(
+                        json.dumps({"tickers": tickers_parsed,
+                                    "count": len(tickers_parsed)}, indent=2)
+                    )
+                    st.cache_data.clear()
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Fehler beim Verarbeiten: {exc}")
 
 load_key = f"loaded_{idx_choice}"
 if load_key not in st.session_state:
