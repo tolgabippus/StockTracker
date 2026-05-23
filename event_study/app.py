@@ -50,125 +50,223 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Font & base */
-html, body, [class*="css"] {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-                 "Helvetica Neue", Arial, sans-serif !important;
-    color: #111827;
+/* ── Reset & font ── */
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+html, body {
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI",
+                 Helvetica, Arial, sans-serif !important;
 }
 
-/* White background */
-.stApp { background-color: #FFFFFF; }
+/* ── App shell ── */
+.stApp {
+    background-color: #FFFFFF !important;
+}
+.stApp > header {
+    background-color: transparent !important;
+}
 
-/* Hide Streamlit chrome */
-#MainMenu, footer, header { display: none !important; }
+/* ── Hide Streamlit chrome ── */
+#MainMenu        { visibility: hidden !important; }
+footer           { visibility: hidden !important; }
+[data-testid="stToolbar"]    { display: none !important; }
+[data-testid="stDecoration"] { display: none !important; }
+[data-testid="stStatusWidget"] { display: none !important; }
 
-/* ── Sidebar ── */
+/* ── Sidebar shell ── */
 [data-testid="stSidebar"] {
     background-color: #F8FAFC !important;
     border-right: 1px solid #E2E8F0 !important;
-    padding-top: 1.5rem !important;
 }
-[data-testid="stSidebar"] section { padding: 0 1rem !important; }
+[data-testid="stSidebar"] > div:first-child {
+    background-color: #F8FAFC !important;
+    padding-top: 1.25rem !important;
+}
+/* Sidebar inner content */
+[data-testid="stSidebarContent"] {
+    background-color: #F8FAFC !important;
+}
 
-/* Sidebar section labels (subheader) */
+/* ── Main content padding ── */
+.main .block-container {
+    padding-top: 2rem !important;
+    padding-left: 2.5rem !important;
+    padding-right: 2.5rem !important;
+    max-width: 1200px !important;
+}
+
+/* ── Typography ── */
+h1, h2, h3, h4 {
+    color: #111827 !important;
+    letter-spacing: -0.02em !important;
+}
+p, li, label, span {
+    color: #374151 !important;
+}
+
+/* ── Sidebar headings (st.subheader) ── */
 [data-testid="stSidebar"] h3 {
     font-size: 0.65rem !important;
-    font-weight: 600 !important;
-    text-transform: uppercase !important;
-    letter-spacing: 0.09em !important;
-    color: #9CA3AF !important;
-    margin-top: 1.4rem !important;
-    margin-bottom: 0.25rem !important;
-}
-
-/* Sidebar title */
-[data-testid="stSidebar"] h2 {
-    font-size: 1rem !important;
-    font-weight: 600 !important;
-    color: #111827 !important;
-    margin-bottom: 0.25rem !important;
-}
-
-/* ── Headings ── */
-h1 {
-    font-size: 1.55rem !important;
     font-weight: 700 !important;
-    color: #111827 !important;
-    letter-spacing: -0.025em !important;
-    margin-bottom: 0.1rem !important;
-}
-h2 {
-    font-size: 1rem !important;
-    font-weight: 600 !important;
-    color: #111827 !important;
-    letter-spacing: -0.01em !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.08em !important;
+    color: #9CA3AF !important;
+    margin: 1.25rem 0 0.3rem 0 !important;
+    padding: 0 !important;
+    border: none !important;
 }
 
-/* ── Buttons ── */
+/* ── Sidebar labels ── */
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
+    font-size: 0.8rem !important;
+    color: #6B7280 !important;
+}
+
+/* ── Date input ── */
+[data-testid="stDateInput"] input {
+    background-color: #FFFFFF !important;
+    border: 1px solid #D1D5DB !important;
+    border-radius: 6px !important;
+    color: #111827 !important;
+    font-size: 0.85rem !important;
+}
+[data-testid="stDateInput"] input:focus {
+    border-color: #2563EB !important;
+    box-shadow: 0 0 0 2px rgba(37,99,235,0.15) !important;
+}
+
+/* ── Checkboxes ── */
+[data-testid="stCheckbox"] label p {
+    font-size: 0.84rem !important;
+    color: #374151 !important;
+}
+[data-testid="stCheckbox"] span[data-testid="stCheckboxWidget"] {
+    border-color: #D1D5DB !important;
+}
+
+/* ── Radio buttons ── */
+[data-testid="stRadio"] label p {
+    font-size: 0.875rem !important;
+    color: #374151 !important;
+}
+
+/* ── Selectbox ── */
+[data-testid="stSelectbox"] > div > div {
+    background-color: #FFFFFF !important;
+    border: 1px solid #D1D5DB !important;
+    border-radius: 6px !important;
+    color: #111827 !important;
+}
+
+/* ── Multiselect ── */
+[data-testid="stMultiSelect"] > div > div {
+    background-color: #FFFFFF !important;
+    border: 1px solid #D1D5DB !important;
+    border-radius: 6px !important;
+}
+
+/* ── Buttons (secondary) ── */
 .stButton > button {
     border-radius: 6px !important;
     font-size: 0.875rem !important;
     font-weight: 500 !important;
     border: 1px solid #D1D5DB !important;
-    background: #FFFFFF !important;
+    background-color: #FFFFFF !important;
     color: #374151 !important;
-    padding: 0.35rem 0.9rem !important;
-    transition: border-color 0.15s, color 0.15s !important;
+    padding: 0.4rem 1rem !important;
+    transition: all 0.15s ease !important;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04) !important;
 }
 .stButton > button:hover {
     border-color: #2563EB !important;
     color: #2563EB !important;
-    background: #FFFFFF !important;
+    background-color: #EFF6FF !important;
+    box-shadow: none !important;
 }
-.stButton > button[kind="primary"] {
-    background: #2563EB !important;
+/* Primary button */
+.stButton > button[kind="primary"],
+button[data-testid="baseButton-primary"] {
+    background-color: #2563EB !important;
     color: #FFFFFF !important;
     border: none !important;
+    box-shadow: 0 1px 3px rgba(37,99,235,0.3) !important;
 }
-.stButton > button[kind="primary"]:hover {
-    background: #1D4ED8 !important;
+.stButton > button[kind="primary"]:hover,
+button[data-testid="baseButton-primary"]:hover {
+    background-color: #1D4ED8 !important;
     color: #FFFFFF !important;
+    box-shadow: 0 2px 6px rgba(37,99,235,0.35) !important;
 }
 
 /* ── Download button ── */
-.stDownloadButton > button {
-    border-radius: 6px !important;
-    font-weight: 500 !important;
-    background: #2563EB !important;
+.stDownloadButton > button,
+button[data-testid="baseButton-primary"].stDownloadButton {
+    background-color: #2563EB !important;
     color: #FFFFFF !important;
     border: none !important;
+    border-radius: 6px !important;
+    font-weight: 500 !important;
+    box-shadow: 0 1px 3px rgba(37,99,235,0.3) !important;
 }
 .stDownloadButton > button:hover {
-    background: #1D4ED8 !important;
-    color: #FFFFFF !important;
+    background-color: #1D4ED8 !important;
+    box-shadow: 0 2px 6px rgba(37,99,235,0.35) !important;
 }
 
-/* ── Radio & Checkbox ── */
-[data-testid="stRadio"] label    { font-size: 0.875rem !important; color: #374151 !important; }
-[data-testid="stCheckbox"] label { font-size: 0.85rem !important;  color: #374151 !important; }
-
-/* ── Selectbox ── */
-[data-testid="stSelectbox"] label { font-size: 0.875rem !important; }
+/* ── Expander ── */
+[data-testid="stExpander"] {
+    border: 1px solid #E5E7EB !important;
+    border-radius: 8px !important;
+    overflow: hidden !important;
+}
+[data-testid="stExpander"] summary {
+    font-size: 0.875rem !important;
+    font-weight: 500 !important;
+    color: #374151 !important;
+    background-color: #FAFAFA !important;
+    padding: 0.6rem 1rem !important;
+}
 
 /* ── Divider ── */
-hr { border: none !important; border-top: 1px solid #F1F5F9 !important; margin: 1.5rem 0 !important; }
+hr {
+    border: none !important;
+    border-top: 1px solid #F1F5F9 !important;
+    margin: 1rem 0 !important;
+}
 
-/* ── Caption ── */
-.stCaption p { color: #9CA3AF !important; font-size: 0.775rem !important; line-height: 1.5 !important; }
-
-/* ── Alerts ── */
-[data-testid="stAlert"] { border-radius: 6px !important; }
-
-/* ── Expander ── */
-details { border: 1px solid #E5E7EB !important; border-radius: 6px !important; }
-summary { font-size: 0.875rem !important; font-weight: 500 !important; color: #374151 !important; }
-
-/* ── DataFrame ── */
-[data-testid="stDataFrame"] iframe { border-radius: 6px !important; }
+/* ── Caption text ── */
+[data-testid="stCaptionContainer"] p,
+.stCaption p {
+    font-size: 0.775rem !important;
+    color: #9CA3AF !important;
+    line-height: 1.6 !important;
+}
 
 /* ── Spinner ── */
-[data-testid="stSpinner"] p { font-size: 0.875rem !important; color: #6B7280 !important; }
+[data-testid="stSpinner"] p {
+    font-size: 0.875rem !important;
+    color: #6B7280 !important;
+}
+
+/* ── Info / Warning / Error boxes ── */
+[data-testid="stAlert"] {
+    border-radius: 8px !important;
+    font-size: 0.875rem !important;
+}
+
+/* ── DataFrame table ── */
+[data-testid="stDataFrame"] > div {
+    border-radius: 8px !important;
+    overflow: hidden !important;
+    border: 1px solid #E5E7EB !important;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #F9FAFB; }
+::-webkit-scrollbar-thumb { background: #D1D5DB; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #9CA3AF; }
 </style>
 """, unsafe_allow_html=True)
 
