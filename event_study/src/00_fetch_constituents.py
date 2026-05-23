@@ -36,19 +36,30 @@ OUTPUT_PATH = ROOT / "data" / "stoxx600_full_tickers.json"
 # ---------------------------------------------------------------------------
 # iShares Holdings URLs (Fallback-Kette)
 # ---------------------------------------------------------------------------
+_PRODUCT_PAGE = (
+    "https://www.ishares.com/uk/individual/en/products/251904/"
+    "ISHARES-STOXX-EUROPE-600-UCITS-ETF"
+)
+_AJAX_SUFFIX = (
+    "/1478358645587.ajax?fileType=csv&fileName=EXSA_holdings&dataType=fund"
+)
+
 ISHARES_URLS = [
-    # UK/EU iShares STOXX Europe 600 UCITS ETF (EXSA)
-    (
-        "https://www.ishares.com/uk/individual/en/products/251904/"
-        "ISHARES-STOXX-EUROPE-600-UCITS-ETF/1478358645587.ajax"
-        "?fileType=csv&fileName=EXSA_holdings&dataType=fund"
-    ),
-    # Alternative: Swiss domain
-    (
-        "https://www.ishares.com/ch/individual/en/products/251904/"
-        "ISHARES-STOXX-EUROPE-600-UCITS-ETF/1478358645587.ajax"
-        "?fileType=csv&fileName=EXSA_holdings&dataType=fund"
-    ),
+    # UK — individual
+    "https://www.ishares.com/uk/individual/en/products/251904/"
+    "ISHARES-STOXX-EUROPE-600-UCITS-ETF" + _AJAX_SUFFIX,
+    # UK — intermediaries
+    "https://www.ishares.com/uk/intermediaries/en/products/251904/"
+    "ISHARES-STOXX-EUROPE-600-UCITS-ETF" + _AJAX_SUFFIX,
+    # DE — Privatanleger
+    "https://www.ishares.com/de/privatanleger/de/products/251904/"
+    "ISHARES-STOXX-EUROPE-600-UCITS-ETF" + _AJAX_SUFFIX,
+    # CH
+    "https://www.ishares.com/ch/individual/en/products/251904/"
+    "ISHARES-STOXX-EUROPE-600-UCITS-ETF" + _AJAX_SUFFIX,
+    # AT
+    "https://www.ishares.com/at/privatanleger/de/products/251904/"
+    "ISHARES-STOXX-EUROPE-600-UCITS-ETF" + _AJAX_SUFFIX,
 ]
 
 # ---------------------------------------------------------------------------
@@ -151,45 +162,65 @@ def build_yfinance_ticker(raw_ticker: str, exchange: str) -> str | None:
 def fetch_ishares_holdings() -> pd.DataFrame | None:
     """Versuche, die iShares Holdings-CSV herunterzuladen.
 
+    Startet eine Session, besucht zuerst die Produktseite (Cookies holen),
+    dann wird die CSV-URL abgerufen. Probiert mehrere Domains als Fallback.
+
     Returns
     -------
     pd.DataFrame or None
         Rohes DataFrame der Holdings oder None bei Fehler.
     """
+    session = requests.Session()
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
     }
+
+    # Produktseite besuchen → Session-Cookies holen
+    try:
+        log.info("Produktseite aufrufen (Cookies) …")
+        session.get(_PRODUCT_PAGE, headers=headers, timeout=15)
+    except Exception as exc:
+        log.warning("Produktseite nicht erreichbar: %s", exc)
+
+    csv_headers = {**headers, "Referer": _PRODUCT_PAGE,
+                   "Accept": "text/csv,application/csv,text/plain,*/*"}
 
     for url in ISHARES_URLS:
         try:
-            log.info("Versuche URL: %s", url[:80] + "…")
-            resp = requests.get(url, headers=headers, timeout=30)
+            log.info("Versuche URL: %s", url[:90] + "…")
+            resp = session.get(url, headers=csv_headers, timeout=30)
             resp.raise_for_status()
 
-            # iShares CSVs haben typischerweise 2 Header-Zeilen
             text = resp.text
+            # iShares CSVs haben typischerweise 2 Header-Zeilen
             for skip in (2, 1, 0):
                 try:
                     df = pd.read_csv(io.StringIO(text), skiprows=skip)
-                    # Prüfen ob Mindest-Spalten vorhanden
-                    if {"Ticker", "Exchange"}.issubset(set(df.columns)):
-                        log.info("CSV erfolgreich geparst (skiprows=%d, %d Zeilen).", skip, len(df))
+                    cols = set(df.columns)
+                    if {"Ticker", "Exchange"}.issubset(cols):
+                        log.info("CSV geparst (skiprows=%d, %d Zeilen).", skip, len(df))
                         return df
-                    # Alternativ englische Spaltennamen
-                    if {"Asset Class", "Name"}.issubset(set(df.columns)):
-                        log.info("CSV gefunden aber Spalten-Mapping unklar — zeige Spalten:")
-                        log.info(list(df.columns))
+                    if {"Asset Class", "Name"}.issubset(cols):
+                        log.info("CSV gefunden — Spalten: %s", list(df.columns))
                         return df
                 except Exception:
                     continue
 
-        except requests.RequestException as exc:
-            log.warning("URL fehlgeschlagen: %s — %s", url[:60], exc)
+            log.warning("CSV geladen, aber keine verwertbaren Spalten gefunden.")
+
+        except Exception as exc:
+            log.warning("URL fehlgeschlagen: %s — %s", url[:70], exc)
 
     return None
 

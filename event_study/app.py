@@ -415,37 +415,8 @@ with st.sidebar:
             if st.checkbox(name, value=True, key=f"cb_{name}"):
                 selected_names.append(name)
 
-    st.markdown("<hr style='margin:1.2rem 0 0.8rem 0'>", unsafe_allow_html=True)
-
-    # STOXX 600 full list status
-    if _FULL_JSON.exists():
-        _n = json.loads(_FULL_JSON.read_text()).get("count", "?")
-        st.markdown(
-            f"<p style='font-size:0.775rem;color:#059669;font-weight:500'>"
-            f"STOXX 600 vollständig geladen ({_n} Aktien)</p>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            "<p style='font-size:0.775rem;color:#D97706;font-weight:500'>"
-            "STOXX 600: Fallback-Liste aktiv (~272 Aktien)</p>",
-            unsafe_allow_html=True,
-        )
-        if st.button("Vollständige Liste laden", use_container_width=True):
-            with st.spinner("Lade STOXX 600 Konstituenten ..."):
-                result = subprocess.run(
-                    [sys.executable, str(ROOT / "src" / "00_fetch_constituents.py")],
-                    capture_output=True, text=True, cwd=str(ROOT),
-                )
-            if result.returncode == 0:
-                st.cache_data.clear()
-                st.rerun()
-            else:
-                st.error("Laden fehlgeschlagen.")
-                st.code(result.stderr[-1000:])
-
     st.markdown(
-        "<p style='font-size:0.72rem;color:#D1D5DB;margin-top:0.5rem'>"
+        "<p style='font-size:0.72rem;color:#9CA3AF;margin-top:1.5rem'>"
         "Kursdaten: Yahoo Finance</p>",
         unsafe_allow_html=True,
     )
@@ -545,7 +516,7 @@ if show_event and pd.Timestamp(start_date) <= EVENT_DATE <= pd.Timestamp(end_dat
 fig.update_layout(
     height=520,
     margin=dict(l=0, r=0, t=10, b=0),
-    hovermode="x unified",
+    hovermode="closest",
     legend=dict(
         orientation="h", y=1.02, x=0,
         yanchor="bottom", xanchor="left",
@@ -647,6 +618,35 @@ if "STOXX 50" in idx_choice:
 else:
     const_tickers = tuple(STOXX600_TICKERS)
     section_label = "STOXX Europe 600"
+
+# ── STOXX 600: vollständige Liste laden (falls noch nicht gecacht) ──
+if "STOXX 600" in idx_choice and not _FULL_JSON.exists():
+    _ba, _bb = st.columns([5, 2])
+    with _ba:
+        st.markdown(
+            "<div style='background:#FEF9C3;border:1px solid #FDE68A;border-radius:6px;"
+            "padding:0.45rem 0.85rem;font-size:0.82rem;color:#92400E'>"
+            "Fallback-Liste aktiv — nur 272 von 600 Aktien verfügbar</div>",
+            unsafe_allow_html=True,
+        )
+    with _bb:
+        if st.button("Alle 600 Aktien laden", use_container_width=True):
+            with st.spinner("Lade vollständige Konstituentenliste ..."):
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "src" / "00_fetch_constituents.py")],
+                    capture_output=True, text=True, cwd=str(ROOT),
+                )
+            if result.returncode == 0:
+                importlib.reload(_constituents_mod)
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error(
+                    "Automatisches Laden fehlgeschlagen — die iShares-URL ist möglicherweise "
+                    "nicht erreichbar. Bitte die Holdings-CSV manuell herunterladen unter: "
+                    "https://www.ishares.com/uk/individual/en/products/251904 "
+                    "und als `event_study/data/stoxx600_manual.csv` speichern."
+                )
 
 load_key = f"loaded_{idx_choice}"
 if load_key not in st.session_state:
