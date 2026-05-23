@@ -889,14 +889,37 @@ else:
                     ).to_excel(writer, sheet_name="Performance")
 
             fname = f"stoxx_{section_label.split()[1].lower()}_{exp_start}_{exp_end}.xlsx"
+            _size_kb = round(len(buf.getvalue()) / 1024)
 
+            st.markdown(
+                f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;
+                               border-radius:10px;padding:1.1rem 1.25rem;
+                               margin:0.75rem 0 0.5rem 0;
+                               display:flex;align-items:center;gap:1.25rem">
+                      <div style="font-size:2rem;line-height:1">&#128190;</div>
+                      <div style="flex:1;min-width:0">
+                        <div style="font-size:0.85rem;font-weight:600;color:#111827;
+                                    white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+                          {fname}
+                        </div>
+                        <div style="font-size:0.775rem;color:#6B7280;margin-top:3px">
+                          {len(tickers_exp_ok)} Aktien
+                          &nbsp;&middot;&nbsp;
+                          {exp_start.strftime('%d.%m.%Y')} &ndash; {exp_end.strftime('%d.%m.%Y')}
+                          &nbsp;&middot;&nbsp;
+                          {_size_kb} KB
+                          &nbsp;&middot;&nbsp;
+                          3 Sheets: Preise &middot; Renditen &middot; Performance
+                        </div>
+                      </div>
+                    </div>""",
+                unsafe_allow_html=True,
+            )
             st.download_button(
-                label=f"Download  —  {len(tickers_exp_ok)} Aktien  ·  "
-                      f"{exp_start.strftime('%d.%m.%Y')} – {exp_end.strftime('%d.%m.%Y')}",
+                label="Excel herunterladen",
                 data=buf.getvalue(),
                 file_name=fname,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
                 use_container_width=True,
             )
-            st.caption("3 Sheets: Preise · Renditen (logarithmisch) · Performance")
