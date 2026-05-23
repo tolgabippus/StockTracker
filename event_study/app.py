@@ -10,6 +10,7 @@ from datetime import date
 from pathlib import Path
 
 import importlib
+import io
 import json
 import subprocess
 
@@ -471,19 +472,54 @@ else:
         valid = [c for c in const_raw.columns if const_raw[c].dropna().size > 10]
         prices_c = const_raw[valid].loc[str(start_date):str(end_date)]
 
-        # Performance berechnen
+        # Tägliche Log-Renditen (für AR-Berechnung)
+        r_daily_all = np.log(prices_c / prices_c.shift(1)).dropna(how="all")
+
+        # Performance + Abnormale Rendite am Ereignistag
         perf_rows = []
         for ticker in valid:
             col = prices_c[ticker].dropna()
             if len(col) < 2:
                 continue
+
             perf_total = col.iloc[-1] / col.iloc[0] - 1
-            nearest = col.index[col.index >= EVENT_DATE]
-            perf_war = (col.iloc[-1] / col.loc[nearest[0]] - 1) if len(nearest) else np.nan
+            nearest    = col.index[col.index >= EVENT_DATE]
+            perf_war   = (col.iloc[-1] / col.loc[nearest[0]] - 1) if len(nearest) else np.nan
+
+            # Tatsächliche Rendite am Ereignistag (oder nächster Handelstag)
+            r_daily = r_daily_all[ticker].dropna() if ticker in r_daily_all else pd.Series(dtype=float)
+            ev_days = r_daily.index[(r_daily.index >= EVENT_DATE) &
+                                    (r_daily.index <= EVENT_DATE + pd.Timedelta(days=4))]
+            r_event = float(r_daily.loc[ev_days[0]]) if len(ev_days) else np.nan
+
+            # Schätzfenster: 60 Handelstage vor Ereignis
+            pre = r_daily[r_daily.index < EVENT_DATE].tail(60)
+            r_mu  = pre.mean() if len(pre) > 10 else np.nan
+            r_sig = pre.std(ddof=1) if len(pre) > 10 else np.nan
+
+            # Abnormale Rendite = tatsächlich − erwartet (mean-adjusted)
+            ar_event = (r_event - r_mu) if not np.isnan(r_event) and not np.isnan(r_mu) else np.nan
+            z_score  = (ar_event / r_sig) if (r_sig and r_sig > 0
+                                               and not np.isnan(ar_event)) else np.nan
+
+            # Ampel-Flag
+            if np.isnan(z_score):
+                flag = "—"
+            elif abs(z_score) > 3:
+                flag = "🚨 extrem"
+            elif abs(z_score) > 2:
+                flag = "⚠️ signifikant"
+            else:
+                flag = "✅ normal"
+
             perf_rows.append({
                 "Ticker":                       ticker,
                 "Gesamt-Performance":           perf_total,
                 "Seit Kriegsbeginn (24.02.22)": perf_war,
+                "Return 24.02.22":              r_event,
+                "Abnormale Rendite (AR)":       ar_event,
+                "Z-Score":                      z_score,
+                "Signal":                       flag,
             })
 
         if not perf_rows:
@@ -529,24 +565,51 @@ else:
 
             # ── Tabelle ─────────────────────────────────────────────────────
             war_ok = pd.Timestamp(end_date) >= EVENT_DATE
+
+            # AR-Spalten nur zeigen wenn Ereignistag im Zeitraum liegt
+            ar_cols_available = (
+                pd.Timestamp(start_date) <= EVENT_DATE <= pd.Timestamp(end_date)
+            )
+
             fmt = {"Gesamt-Performance": "{:+.1%}"}
             grad_cols = ["Gesamt-Performance"]
+            drop_cols = []
+
             if war_ok:
                 fmt["Seit Kriegsbeginn (24.02.22)"] = "{:+.1%}"
                 grad_cols.append("Seit Kriegsbeginn (24.02.22)")
             else:
-                df_c = df_c.drop(columns=["Seit Kriegsbeginn (24.02.22)"])
+                drop_cols.append("Seit Kriegsbeginn (24.02.22)")
+
+            if ar_cols_available:
+                fmt["Return 24.02.22"]        = "{:+.2%}"
+                fmt["Abnormale Rendite (AR)"] = "{:+.2%}"
+                fmt["Z-Score"]                = "{:.2f}"
+                grad_cols += ["Return 24.02.22", "Abnormale Rendite (AR)"]
+            else:
+                drop_cols += ["Return 24.02.22", "Abnormale Rendite (AR)",
+                              "Z-Score", "Signal"]
+
+            if drop_cols:
+                df_c = df_c.drop(columns=[c for c in drop_cols if c in df_c.columns])
 
             st.dataframe(
                 df_c.style
                     .format(fmt, na_rep="—")
                     .background_gradient(
                         subset=grad_cols, cmap="RdYlGn",
-                        vmin=-0.4, vmax=0.4,
+                        vmin=-0.15, vmax=0.15,
                     ),
                 use_container_width=True,
-                height=min(38 + len(df_c) * 35, 600),
+                height=min(38 + len(df_c) * 35, 650),
             )
+
+            if ar_cols_available:
+                st.caption(
+                    "**Abnormale Rendite (AR)** = Return am 24.02.22 − ∅ Return "
+                    "(60 Handelstage vor Ereignis, mean-adjusted Modell)  ·  "
+                    "⚠️ |Z| > 2  ·  🚨 |Z| > 3"
+                )
 
             st.caption(
                 f"✅ {len(valid)} von {len(const_tickers)} Tickern geladen · "
@@ -557,3 +620,83 @@ else:
                 st.session_state[load_key] = False
                 st.cache_data.clear()
                 st.rerun()
+
+            # ── Excel-Export ────────────────────────────────────────────────
+            st.divider()
+            st.subheader("📤 Excel-Export")
+
+            exp_a, exp_b, exp_c_col = st.columns([3, 1, 1])
+            with exp_a:
+                export_sel = st.multiselect(
+                    "Aktien auswählen (leer = alle)",
+                    options=list(df_c.index),
+                    default=[],
+                    placeholder=f"Alle {len(df_c)} Aktien",
+                )
+            with exp_b:
+                exp_start = st.date_input("Von", value=start_date,  key="exp_s")
+            with exp_c_col:
+                exp_end   = st.date_input("Bis", value=end_date,    key="exp_e")
+
+            # Welche Tickers exportieren?
+            tickers_exp = export_sel if export_sel else list(df_c.index)
+            tickers_exp_ok = [t for t in tickers_exp if t in prices_c.columns]
+
+            # Preise im gewählten Zeitraum
+            prices_exp = prices_c[tickers_exp_ok].loc[str(exp_start):str(exp_end)]
+
+            # Log-Renditen
+            returns_exp = np.log(prices_exp / prices_exp.shift(1)).dropna(how="all")
+
+            # Performance-Tabelle für Export-Auswahl neu berechnen
+            perf_rows_exp = []
+            for t in tickers_exp_ok:
+                col_t = prices_exp[t].dropna()
+                if len(col_t) < 2:
+                    continue
+                p_total = col_t.iloc[-1] / col_t.iloc[0] - 1
+                near = col_t.index[col_t.index >= EVENT_DATE]
+                p_war = (col_t.iloc[-1] / col_t.loc[near[0]] - 1) if len(near) else np.nan
+                perf_rows_exp.append({
+                    "Ticker": t,
+                    "Gesamt-Performance": p_total,
+                    "Seit Kriegsbeginn (24.02.22)": p_war,
+                    "Von": str(exp_start),
+                    "Bis": str(exp_end),
+                })
+            df_exp_perf = pd.DataFrame(perf_rows_exp).set_index("Ticker") if perf_rows_exp else pd.DataFrame()
+
+            # Excel in Buffer schreiben
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                # Preise
+                prices_exp.round(4).to_excel(writer, sheet_name="Preise")
+                # Log-Renditen
+                returns_exp.round(6).to_excel(writer, sheet_name="Renditen")
+                # Performance-Übersicht
+                if not df_exp_perf.empty:
+                    df_exp_perf.style \
+                        .format({
+                            "Gesamt-Performance":           "{:+.2%}",
+                            "Seit Kriegsbeginn (24.02.22)": "{:+.2%}",
+                        }, na_rep="—") \
+                        .to_excel(writer, sheet_name="Performance")
+
+            filename = (
+                f"stoxx_{section_label.split()[1].lower()}_"
+                f"{exp_start}_{exp_end}.xlsx"
+            ).replace(" ", "_")
+
+            st.download_button(
+                label=(
+                    f"📥 Excel herunterladen  —  "
+                    f"{len(tickers_exp_ok)} Aktien  ·  "
+                    f"{exp_start.strftime('%d.%m.%Y')} – {exp_end.strftime('%d.%m.%Y')}"
+                ),
+                data=buf.getvalue(),
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                use_container_width=True,
+            )
+            st.caption("Enthält 3 Sheets: **Preise** · **Renditen** (Log) · **Performance**")
