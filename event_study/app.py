@@ -246,20 +246,26 @@ for name in available:
         ),
     ))
 
-# War annotation — x als String übergeben (pd.Timestamp nicht kompatibel mit add_vline)
+# War annotation — add_shape + add_annotation (add_vline ist mit Datetime-Achsen buggy)
 if show_event and pd.Timestamp(start_date) <= EVENT_DATE <= pd.Timestamp(end_date):
-    fig.add_vline(
-        x=EVENT_DATE_STR,
+    fig.add_shape(
+        type="line",
+        x0=EVENT_DATE_STR, x1=EVENT_DATE_STR,
+        y0=0, y1=1,
+        xref="x", yref="paper",
         line=dict(color="red", width=1.5, dash="dash"),
-        annotation=dict(
-            text="🔴 Kriegsbeginn<br>24.02.2022",
-            font=dict(size=11, color="red"),
-            bgcolor="rgba(255,255,255,0.85)",
-            bordercolor="red",
-            borderwidth=1,
-            xanchor="left",
-        ),
-        annotation_position="top right",
+    )
+    fig.add_annotation(
+        x=EVENT_DATE_STR,
+        y=0.97,
+        xref="x", yref="paper",
+        text="🔴 Kriegsbeginn<br>24.02.2022",
+        showarrow=False,
+        font=dict(size=11, color="red"),
+        bgcolor="rgba(255,255,255,0.85)",
+        bordercolor="red",
+        borderwidth=1,
+        xanchor="left",
     )
 
 fig.update_layout(
