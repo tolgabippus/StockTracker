@@ -318,19 +318,35 @@ for name in available:
 
 if rows:
     df_perf = pd.DataFrame(rows).set_index("Index")
-    st.dataframe(
-        df_perf.style
-            .format({
-                "Gesamt-Performance":           "{:+.1%}",
-                "Seit Kriegsbeginn (24.02.22)": "{:+.1%}",
-            })
-            .background_gradient(
-                subset=["Gesamt-Performance", "Seit Kriegsbeginn (24.02.22)"],
-                cmap="RdYlGn", vmin=-0.5, vmax=0.5,
-            ),
-        use_container_width=True,
-        height=38 + len(rows) * 35,
-    )
+
+    war_in_range = pd.Timestamp(end_date) >= EVENT_DATE
+
+    if war_in_range:
+        style = (
+            df_perf.style
+                .format({
+                    "Gesamt-Performance":           "{:+.1%}",
+                    "Seit Kriegsbeginn (24.02.22)": "{:+.1%}",
+                }, na_rep="—")
+                .background_gradient(
+                    subset=["Gesamt-Performance", "Seit Kriegsbeginn (24.02.22)"],
+                    cmap="RdYlGn", vmin=-0.5, vmax=0.5,
+                )
+        )
+    else:
+        # Enddatum liegt vor dem Kriegsbeginn → Spalte weglassen
+        df_perf = df_perf.drop(columns=["Seit Kriegsbeginn (24.02.22)"])
+        style = (
+            df_perf.style
+                .format({"Gesamt-Performance": "{:+.1%}"})
+                .background_gradient(
+                    subset=["Gesamt-Performance"],
+                    cmap="RdYlGn", vmin=-0.5, vmax=0.5,
+                )
+        )
+        st.caption("ℹ️ Enddatum liegt vor dem 24.02.2022 — Kriegsbeginn-Spalte nicht verfügbar.")
+
+    st.dataframe(style, use_container_width=True, height=38 + len(rows) * 35)
 
 # ---------------------------------------------------------------------------
 # ETF-Proxy-Legende
