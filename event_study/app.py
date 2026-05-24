@@ -80,26 +80,37 @@ html, body {
     padding-top: 1.5rem !important;
 }
 
-/* ── Sidebar: expand button when sidebar is CLOSED — must stay visible ── */
+/* ── Sidebar expand button (appears when sidebar is closed) ── */
 [data-testid="collapsedControl"] {
-    background: #FFFFFF !important;
-    border-right: 1px solid #E2E8F0 !important;
-    box-shadow: 2px 0 8px rgba(0,0,0,0.06) !important;
+    background: #2563EB !important;
+    border-radius: 0 8px 8px 0 !important;
+    border: none !important;
+    box-shadow: 3px 0 12px rgba(37,99,235,0.25) !important;
     z-index: 999999 !important;
     visibility: visible !important;
     display: flex !important;
     opacity: 1 !important;
+    min-width: 28px !important;
 }
-[data-testid="collapsedControl"] button {
+[data-testid="collapsedControl"] button,
+[data-testid="collapsedControl"] > button {
     background: transparent !important;
-    color: #374151 !important;
+    color: #FFFFFF !important;
     visibility: visible !important;
     opacity: 1 !important;
 }
 [data-testid="collapsedControl"] svg {
-    fill: #374151 !important;
-    color: #374151 !important;
+    fill: #FFFFFF !important;
+    color: #FFFFFF !important;
     visibility: visible !important;
+}
+/* Sidebar close button (chevron inside sidebar) */
+[data-testid="stSidebarCollapseButton"] button {
+    color: #9CA3AF !important;
+}
+[data-testid="stSidebarCollapseButton"] button:hover {
+    color: #374151 !important;
+    background: #F1F5F9 !important;
 }
 
 /* ── Sidebar section labels ── */
@@ -469,13 +480,6 @@ with st.sidebar:
     st.markdown("<div style='height:1px;background:#E2E8F0;margin-bottom:0.5rem'></div>",
                 unsafe_allow_html=True)
 
-    st.subheader("Zeitraum")
-    c1, c2 = st.columns(2)
-    with c1:
-        start_date = st.date_input("Von", value=date(2021, 1, 1), label_visibility="visible")
-    with c2:
-        end_date = st.date_input("Bis", value=date.today(), label_visibility="visible")
-
     st.subheader("Darstellung")
     mode = st.radio("Modus", ["Normiert (Basis 100)", "Absolut"],
                     horizontal=True, label_visibility="collapsed")
@@ -488,20 +492,27 @@ with st.sidebar:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Page header
+# Page header — title left · date range right (always visible)
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown(
-    "<h1 style='margin-bottom:2px'>Globaler Marktvergleich</h1>"
-    f"<p style='font-size:0.84rem;color:#9CA3AF;margin:0 0 1rem 0'>"
-    f"{start_date.strftime('%d.%m.%Y')} – {end_date.strftime('%d.%m.%Y')}"
-    f"&nbsp;&nbsp;·&nbsp;&nbsp;{mode}</p>",
-    unsafe_allow_html=True,
-)
+_hdr_l, _hdr_r = st.columns([3, 2])
+with _hdr_l:
+    st.markdown(
+        "<h1 style='margin-bottom:0;margin-top:0.15rem'>Globaler Marktvergleich</h1>"
+        "<p style='font-size:0.84rem;color:#9CA3AF;margin:2px 0 0.75rem 0'>"
+        "Russland-Ukraine-Krieg &nbsp;·&nbsp; Feb 2022</p>",
+        unsafe_allow_html=True,
+    )
+with _hdr_r:
+    _dc1, _dc2 = st.columns(2)
+    with _dc1:
+        start_date = st.date_input("Von", value=date(2021, 1, 1), label_visibility="visible")
+    with _dc2:
+        end_date = st.date_input("Bis", value=date.today(), label_visibility="visible")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────────────────────────────────────
-tab_markt, tab_aktien = st.tabs(["Marktvergleich", "Einzelaktien"])
+tab_markt, tab_aktien = st.tabs(["Indizes", "Einzelaktien"])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -816,7 +827,7 @@ with tab_aktien:
             f"danach für 1 Stunde gespeichert.</p>",
             unsafe_allow_html=True,
         )
-        if st.button(f"{section_label} laden", type="primary"):
+        if st.button("Aktien laden", type="primary"):
             st.session_state[load_key] = True
             st.rerun()
 
@@ -873,6 +884,21 @@ with tab_aktien:
                 if   "absteigend"  in sort_dir: df_c = df_c.sort_values("Performance", ascending=False)
                 elif "aufsteigend" in sort_dir: df_c = df_c.sort_values("Performance", ascending=True)
                 else:                           df_c = df_c.sort_index()
+
+                # ── KPI Cards ────────────────────────────────────────────────
+                _ea_perfs = df_c["Performance"].dropna()
+                if len(_ea_perfs) >= 2:
+                    _ea_best_t  = _ea_perfs.idxmax()
+                    _ea_worst_t = _ea_perfs.idxmin()
+                    _ea_avg     = _ea_perfs.mean()
+                    _eac1, _eac2, _eac3 = st.columns(3)
+                    metric_card(_eac1, "Bestes Ergebnis",
+                                _ea_perfs[_ea_best_t], _ea_best_t)
+                    metric_card(_eac2, "Schwächstes Ergebnis",
+                                _ea_perfs[_ea_worst_t], _ea_worst_t)
+                    metric_card(_eac3, "Durchschnitt",
+                                _ea_avg, f"{len(_ea_perfs)} Aktien · {section_label}")
+                    st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
 
                 # ── Bar chart ────────────────────────────────────────────────
                 divider()
