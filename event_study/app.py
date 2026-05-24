@@ -80,18 +80,10 @@ html, body {
     padding-top: 1.5rem !important;
 }
 
-/* Sidebar collapse button — cleaner */
+/* Sidebar collapse button */
 [data-testid="collapsedControl"] {
-    background-color: #F1F5F9 !important;
+    background-color: #F8FAFC !important;
     border-right: 1px solid #E2E8F0 !important;
-    width: 1.75rem !important;
-}
-[data-testid="collapsedControl"] svg {
-    color: #9CA3AF !important;
-    width: 14px !important;
-}
-button[data-testid="baseButton-headerNoPadding"] {
-    color: #9CA3AF !important;
 }
 
 /* ── Sidebar section labels ── */
@@ -417,13 +409,10 @@ with st.sidebar:
                     horizontal=True, label_visibility="collapsed")
     show_event = st.checkbox("Kriegsbeginn markieren", value=True)
 
-    st.markdown(
-        "<div style='position:absolute;bottom:1.5rem;left:1rem;right:1rem'>"
-        "<div style='height:1px;background:#E2E8F0;margin-bottom:0.75rem'></div>"
-        "<div style='font-size:0.72rem;color:#C4C9D4'>Kursdaten: Yahoo Finance</div>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("<div style='height:1px;background:#E2E8F0;margin-top:2rem;margin-bottom:0.5rem'></div>",
+                unsafe_allow_html=True)
+    st.markdown("<div style='font-size:0.72rem;color:#C4C9D4'>Kursdaten: Yahoo Finance</div>",
+                unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
