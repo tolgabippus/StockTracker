@@ -437,19 +437,18 @@ tab_markt, tab_aktien = st.tabs(["Marktvergleich", "Einzelaktien"])
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_markt:
 
-    # ── Index-Auswahl (kompakt, inline) ─────────────────────────────────────
-    st.markdown(
-        "<p style='font-size:0.75rem;font-weight:600;color:#6B7280;"
-        "text-transform:uppercase;letter-spacing:0.07em;margin-bottom:0.5rem'>Indizes</p>",
-        unsafe_allow_html=True,
-    )
-    region_cols = st.columns(len(REGIONS))
+    # ── Index-Auswahl: gewichtete Spalten nach Anzahl Einträge ──────────────
+    # Amerika 2, Asien 2, Australien 1, Europa 5  →  Proportionen 2:2:1:4
     selected_names: list[str] = []
+    _region_weights = {"Amerika": 2, "Asien": 2, "Australien": 1.5, "Europa": 4}
+    _col_weights = [_region_weights[r] for r in REGIONS]
+    region_cols = st.columns(_col_weights)
     for col, region in zip(region_cols, REGIONS):
         with col:
             st.markdown(
-                f"<p style='font-size:0.72rem;color:#9CA3AF;font-weight:600;"
-                f"text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.2rem'>"
+                f"<p style='font-size:0.68rem;font-weight:700;color:#9CA3AF;"
+                f"text-transform:uppercase;letter-spacing:0.08em;"
+                f"margin:0 0 0.4rem 0;border-bottom:1px solid #F1F5F9;padding-bottom:0.3rem'>"
                 f"{region}</p>",
                 unsafe_allow_html=True,
             )
