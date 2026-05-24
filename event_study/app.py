@@ -80,10 +80,26 @@ html, body {
     padding-top: 1.5rem !important;
 }
 
-/* Sidebar collapse button */
+/* ── Sidebar: expand button when sidebar is CLOSED — must stay visible ── */
 [data-testid="collapsedControl"] {
-    background-color: #F8FAFC !important;
+    background: #FFFFFF !important;
     border-right: 1px solid #E2E8F0 !important;
+    box-shadow: 2px 0 8px rgba(0,0,0,0.06) !important;
+    z-index: 999999 !important;
+    visibility: visible !important;
+    display: flex !important;
+    opacity: 1 !important;
+}
+[data-testid="collapsedControl"] button {
+    background: transparent !important;
+    color: #374151 !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+[data-testid="collapsedControl"] svg {
+    fill: #374151 !important;
+    color: #374151 !important;
+    visibility: visible !important;
 }
 
 /* ── Sidebar section labels ── */
@@ -261,6 +277,32 @@ hr { border: none !important; border-top: 1px solid #F1F5F9 !important; margin: 
     border: 1px solid #E5E7EB !important;
 }
 
+/* ── Chart card ── */
+[data-testid="stPlotlyChart"] > div {
+    border-radius: 10px !important;
+    overflow: hidden !important;
+    border: 1px solid #F1F5F9 !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05) !important;
+}
+
+/* ── Smooth transitions ── */
+.stButton > button,
+[data-testid="stCheckbox"] label,
+[data-testid="stRadio"] label,
+[data-testid="stSelectbox"] > div > div {
+    transition: all 0.15s ease !important;
+}
+[data-testid="stCheckbox"]:hover label p { color: #111827 !important; }
+
+/* ── Metric cards ── */
+.kpi-card {
+    background: #FAFAFA;
+    border: 1px solid #E5E7EB;
+    border-radius: 10px;
+    padding: 0.85rem 1rem;
+    height: 100%;
+}
+
 /* ── Scrollbar ── */
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: #F9FAFB; }
@@ -287,6 +329,12 @@ INDICES: dict[str, dict] = {
 }
 
 REGIONS    = ["Amerika", "Asien", "Australien", "Europa"]
+REGION_COLORS = {
+    "Amerika":    "#EF4444",
+    "Asien":      "#059669",
+    "Australien": "#D97706",
+    "Europa":     "#2563EB",
+}
 EVENT_DATE = pd.Timestamp("2022-02-24")
 EVENT_STR  = "2022-02-24"
 
@@ -356,16 +404,19 @@ def excel_export_card(
     _kb = round(len(buf.getvalue()) / 1024)
     st.markdown(
         f"""<div style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:10px;
-                        padding:1rem 1.25rem;margin:0.75rem 0 0.5rem 0;
-                        display:flex;align-items:center;gap:1rem">
-              <div style="font-size:1.75rem;line-height:1;flex-shrink:0">&#128190;</div>
+                        padding:0.9rem 1.1rem;margin:0.75rem 0 0.5rem 0;
+                        display:flex;align-items:center;gap:0.9rem">
+              <div style="flex-shrink:0;width:38px;height:38px;background:#166534;
+                          border-radius:7px;display:flex;align-items:center;
+                          justify-content:center;font-size:0.55rem;font-weight:800;
+                          color:white;letter-spacing:0.03em;line-height:1">XLSX</div>
               <div style="flex:1;min-width:0">
                 <div style="font-size:0.84rem;font-weight:600;color:#111827;
                             white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{fname}</div>
-                <div style="font-size:0.75rem;color:#6B7280;margin-top:3px">
-                  {n_items} Einträge &middot;
-                  {start.strftime('%d.%m.%Y')} &ndash; {end.strftime('%d.%m.%Y')} &middot;
-                  {_kb} KB &middot; {sheet_desc}
+                <div style="font-size:0.74rem;color:#6B7280;margin-top:3px">
+                  {n_items} Einträge &nbsp;·&nbsp;
+                  {start.strftime('%d.%m.%Y')} – {end.strftime('%d.%m.%Y')} &nbsp;·&nbsp;
+                  {_kb} KB &nbsp;·&nbsp; {sheet_desc}
                 </div>
               </div>
             </div>""",
@@ -379,6 +430,27 @@ def excel_export_card(
         type="primary",
         use_container_width=True,
     )
+
+
+def metric_card(col, label: str, value: float, sub: str) -> None:
+    """Render a compact KPI card with colour-coded value."""
+    clr = "#16A34A" if value >= 0 else "#DC2626"
+    bg  = "#F0FDF4" if value >= 0 else "#FEF2F2"
+    with col:
+        st.markdown(
+            f"<div style='background:{bg};border:1px solid #E5E7EB;"
+            f"border-radius:10px;padding:0.85rem 1rem;"
+            f"border-left:3px solid {clr}'>"
+            f"<div style='font-size:0.62rem;font-weight:700;color:#9CA3AF;"
+            f"text-transform:uppercase;letter-spacing:0.07em;margin-bottom:0.3rem'>"
+            f"{label}</div>"
+            f"<div style='font-size:1.2rem;font-weight:700;color:{clr};"
+            f"letter-spacing:-0.02em;line-height:1.1'>{value:+.1%}</div>"
+            f"<div style='font-size:0.72rem;color:#6B7280;margin-top:0.3rem;"
+            f"overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{sub}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -445,11 +517,16 @@ with tab_markt:
     region_cols = st.columns(_col_weights)
     for col, region in zip(region_cols, REGIONS):
         with col:
+            _rc = REGION_COLORS[region]
             st.markdown(
-                f"<p style='font-size:0.68rem;font-weight:700;color:#9CA3AF;"
+                f"<div style='font-size:0.67rem;font-weight:700;color:{_rc};"
                 f"text-transform:uppercase;letter-spacing:0.08em;"
-                f"margin:0 0 0.4rem 0;border-bottom:1px solid #F1F5F9;padding-bottom:0.3rem'>"
-                f"{region}</p>",
+                f"margin:0 0 0.5rem 0;border-bottom:2px solid {_rc}30;"
+                f"padding-bottom:0.35rem;"
+                f"display:flex;align-items:center;gap:6px'>"
+                f"<span style='display:inline-block;width:6px;height:6px;"
+                f"border-radius:50%;background:{_rc};flex-shrink:0'></span>"
+                f"{region}</div>",
                 unsafe_allow_html=True,
             )
             for name, meta in INDICES.items():
@@ -487,6 +564,22 @@ with tab_markt:
     prices.columns = [ticker_to_name[c] for c in prices.columns]
     prices = prices.loc[str(start_date):str(end_date)]
     plot_data = normalize(prices) if mode == "Normiert (Basis 100)" else prices
+
+    # ── KPI Cards ────────────────────────────────────────────────────────────
+    _perfs_kpi = {
+        n: (prices[n].dropna().iloc[-1] / prices[n].dropna().iloc[0] - 1)
+        for n in available if prices[n].dropna().size >= 2
+    }
+    if len(_perfs_kpi) >= 2:
+        _best_n  = max(_perfs_kpi, key=_perfs_kpi.get)
+        _worst_n = min(_perfs_kpi, key=_perfs_kpi.get)
+        _avg_kpi = sum(_perfs_kpi.values()) / len(_perfs_kpi)
+        _kc1, _kc2, _kc3 = st.columns(3)
+        metric_card(_kc1, "Bestes Ergebnis",      _perfs_kpi[_best_n],  _best_n)
+        metric_card(_kc2, "Schwächstes Ergebnis", _perfs_kpi[_worst_n], _worst_n)
+        metric_card(_kc3, "Durchschnitt",          _avg_kpi,
+                    f"{len(_perfs_kpi)} Indizes · {mode}")
+        st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
 
     # ── Chart ────────────────────────────────────────────────────────────────
     divider()
