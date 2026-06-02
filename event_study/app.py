@@ -15,11 +15,11 @@ from datetime import date
 from pathlib import Path
 
 try:
-    import anthropic as _anthropic_mod
-    _ANTHROPIC_OK = True
+    from openai import OpenAI as _OpenAI
+    _OPENAI_OK = True
 except ImportError:
-    _anthropic_mod = None
-    _ANTHROPIC_OK = False
+    _OpenAI = None
+    _OPENAI_OK = False
 
 import numpy as np
 import pandas as pd
@@ -531,21 +531,24 @@ If no reliable pre-war data is available for a section, explicitly state "Keine 
 
 
 def run_russia_analysis(api_key: str, company: str) -> str:
-    """Call Claude API to assess pre-war Russian exposure of a company."""
-    client = _anthropic_mod.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model="claude-opus-4-8",
+    """Call DeepSeek API to assess pre-war Russian exposure of a company."""
+    client = _OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    resp = client.chat.completions.create(
+        model="deepseek-chat",
         max_tokens=4096,
-        system=_RUSSIA_SYS,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"Assess the PRE-WAR Russian exposure of: **{company}**\n\n"
-                "Use ONLY information publicly available before 24 February 2022."
-            ),
-        }],
+        temperature=0.1,
+        messages=[
+            {"role": "system", "content": _RUSSIA_SYS},
+            {
+                "role": "user",
+                "content": (
+                    f"Assess the PRE-WAR Russian exposure of: **{company}**\n\n"
+                    "Use ONLY information publicly available before 24 February 2022."
+                ),
+            },
+        ],
     )
-    return msg.content[0].text
+    return resp.choices[0].message.content
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1119,39 +1122,40 @@ with tab_russia:
     )
 
     # ── API Key ──────────────────────────────────────────────────────────────
-    _env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    _env_key = os.environ.get("DEEPSEEK_API_KEY", "")
     _exp_label = (
         "API Key &nbsp;·&nbsp; aus Umgebungsvariable geladen"
-        if _env_key else "API Key einrichten"
+        if _env_key else "DeepSeek API Key einrichten"
     )
     with st.expander(_exp_label, expanded=not bool(_env_key)):
         if not _env_key:
             st.markdown(
                 "<div style='font-size:0.8rem;color:#6B7280;margin-bottom:0.6rem'>"
-                "Kostenlosen Key erstellen: "
-                "<a href='https://console.anthropic.com/settings/keys' target='_blank' "
-                "style='color:#2563EB;font-weight:500'>console.anthropic.com</a> "
-                "&nbsp;→&nbsp; API Keys &nbsp;→&nbsp; Create Key"
+                "Key erstellen unter "
+                "<a href='https://platform.deepseek.com/api_keys' target='_blank' "
+                "style='color:#2563EB;font-weight:500'>platform.deepseek.com</a> "
+                "&nbsp;→&nbsp; API Keys &nbsp;→&nbsp; Create API Key<br>"
+                "<span style='color:#9CA3AF'>Kosten: ~$0.001–0.002 pro Analyse (DeepSeek-V3)</span>"
                 "</div>",
                 unsafe_allow_html=True,
             )
         _key_input = st.text_input(
             "Key",
             type="password",
-            placeholder="sk-ant-api03-..." if not _env_key else "(aus ANTHROPIC_API_KEY)",
+            placeholder="sk-..." if not _env_key else "(aus DEEPSEEK_API_KEY)",
             label_visibility="collapsed",
-            key="ant_key",
+            key="ds_key",
         )
     _api_key = _key_input.strip() if _key_input else _env_key
 
     # ── Pakete / Key prüfen ──────────────────────────────────────────────────
-    if not _ANTHROPIC_OK:
+    if not _OPENAI_OK:
         st.error(
-            "`anthropic` Paket nicht installiert. "
-            "Bitte `pip install anthropic` ausfuehren und App neu starten."
+            "`openai` Paket nicht installiert. "
+            "Bitte `pip install openai` ausfuehren und App neu starten."
         )
     elif not _api_key:
-        st.info("Bitte zuerst einen Anthropic API Key eingeben (siehe oben).")
+        st.info("Bitte zuerst einen DeepSeek API Key eingeben (siehe oben).")
     else:
         # ── Unternehmensauswahl ──────────────────────────────────────────────
         divider("Unternehmen auswählen")
