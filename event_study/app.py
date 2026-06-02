@@ -30,8 +30,9 @@ import yfinance as yf
 import data.constituents as _constituents_mod
 from data.constituents import STOXX50_TICKERS
 
-ROOT       = Path(__file__).resolve().parent
-_FULL_JSON = ROOT / "data" / "stoxx600_full_tickers.json"
+ROOT         = Path(__file__).resolve().parent
+_FULL_JSON   = ROOT / "data" / "stoxx600_full_tickers.json"
+_SCORES_PATH = ROOT / "data" / "russia_scores.json"
 
 
 def _get_stoxx600() -> list[str]:
@@ -473,6 +474,66 @@ def metric_card(col, label: str, value: float, sub: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Thesis-Analyse — Score-Persistenz & AR-Berechnung
+# ─────────────────────────────────────────────────────────────────────────────
+def load_scores() -> pd.DataFrame:
+    """Load Russia exposure scores from JSON file."""
+    _empty = pd.DataFrame({
+        "Ticker":             pd.Series(dtype=str),
+        "Unternehmen":        pd.Series(dtype=str),
+        "Sektor":             pd.Series(dtype=str),
+        "Revenue Score":      pd.Series(dtype=int),
+        "Operational Score":  pd.Series(dtype=int),
+        "Confidence":         pd.Series(dtype=str),
+        "Notizen":            pd.Series(dtype=str),
+    })
+    if not _SCORES_PATH.exists():
+        return _empty
+    try:
+        records = json.loads(_SCORES_PATH.read_text())
+        df = pd.DataFrame(records)
+        for col in ["Revenue Score", "Operational Score"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        return df
+    except Exception:
+        return _empty
+
+
+def save_scores(df: pd.DataFrame) -> None:
+    """Persist Russia exposure scores to JSON file."""
+    _SCORES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _SCORES_PATH.write_text(
+        json.dumps(df.to_dict(orient="records"), indent=2, ensure_ascii=False)
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def calc_ar_thesis(tickers: tuple[str, ...]) -> pd.DataFrame:
+    """Download prices and compute ARs for the event date (fixed window 2020–2022)."""
+    raw = download_batch(tickers, "2020-01-01", "2022-04-01")
+    if raw.empty:
+        return pd.DataFrame()
+    rows = []
+    for ticker in tickers:
+        if ticker not in raw.columns:
+            continue
+        col = raw[ticker].dropna()
+        if len(col) < 20:
+            continue
+        r = np.log(col / col.shift(1)).dropna()
+        ev = r.index[(r.index >= EVENT_DATE) & (r.index <= EVENT_DATE + pd.Timedelta(days=4))]
+        r_event = float(r.loc[ev[0]]) if len(ev) else np.nan
+        pre   = r[r.index < EVENT_DATE].tail(60)
+        r_mu  = pre.mean()     if len(pre) > 10 else np.nan
+        r_sig = pre.std(ddof=1) if len(pre) > 10 else np.nan
+        ar = (r_event - r_mu) if not (np.isnan(r_event) or np.isnan(r_mu)) else np.nan
+        z  = (ar / r_sig)     if (r_sig and r_sig > 0 and not np.isnan(ar)) else np.nan
+        rows.append({"Ticker": ticker, "AR": ar, "Z-Score": z, "Return 24.02.": r_event})
+    return pd.DataFrame(rows).set_index("Ticker") if rows else pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Russland-Analyse — Systemprompt & API-Wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 _RUSSIA_SYS = """\
@@ -621,7 +682,9 @@ with _hdr_r:
 # ─────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────────────────────────────────────
-tab_markt, tab_aktien, tab_russia = st.tabs(["Indizes", "Einzelaktien", "Russland-Analyse"])
+tab_markt, tab_aktien, tab_russia, tab_thesis = st.tabs(
+    ["Indizes", "Einzelaktien", "Russland-Analyse", "Thesis-Analyse"]
+)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1271,3 +1334,322 @@ with tab_russia:
                 "dann auf &laquo;Analyse starten&raquo; klicken.</p>",
                 unsafe_allow_html=True,
             )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 4 — THESIS-ANALYSE  (Russia Exposure × Abnormale Renditen)
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_thesis:
+
+    st.markdown(
+        "<div style='background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;"
+        "padding:0.85rem 1.1rem;margin-bottom:1.25rem'>"
+        "<div style='font-size:0.84rem;font-weight:600;color:#1E40AF'>"
+        "Thesis-Analyse — Russia Exposure × Abnormale Renditen</div>"
+        "<div style='font-size:0.78rem;color:#1D4ED8;margin-top:3px;line-height:1.5'>"
+        "Trage die Exposure-Scores aus der Russland-Analyse ein, dann berechne die "
+        "Abnormalen Renditen vom 24.02.2022. Das Ergebnis ist die Datenbasis für "
+        "deine Regressionsanalyse."
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Score-Tabelle ─────────────────────────────────────────────────────────
+    divider("Exposure-Scores")
+    st.caption(
+        "Ticker-Format: SAP.DE · NESN.SW · BP.L · ENI.MI usw. — "
+        "Revenue/Operational Score je 0–3 gemäß Thesis-Methodologie."
+    )
+
+    _df_sc = load_scores()
+    _edited = st.data_editor(
+        _df_sc,
+        column_config={
+            "Ticker": st.column_config.TextColumn(
+                "Ticker", width="small", help="yfinance-Ticker, z.B. SAP.DE"
+            ),
+            "Unternehmen": st.column_config.TextColumn("Unternehmen", width="medium"),
+            "Sektor": st.column_config.TextColumn("Sektor (GICS)", width="medium"),
+            "Revenue Score": st.column_config.SelectboxColumn(
+                "Rev. Score", options=[0, 1, 2, 3], width="small",
+                help="0 = <1 % · 1 = 1–5 % · 2 = 5–10 % · 3 = >10 % Russland-Umsatz",
+            ),
+            "Operational Score": st.column_config.SelectboxColumn(
+                "Op. Score", options=[0, 1, 2, 3], width="small",
+                help="0 = keine · 1 = begrenzt · 2 = signifikant · 3 = kritisch",
+            ),
+            "Confidence": st.column_config.SelectboxColumn(
+                "Confidence", options=["High", "Medium", "Low"], width="small",
+            ),
+            "Notizen": st.column_config.TextColumn("Notizen / Flags", width="large"),
+        },
+        num_rows="dynamic",
+        use_container_width=True,
+        key="scores_editor",
+        height=min(380, 80 + len(_df_sc) * 36),
+    )
+
+    _sc1, _sc2, _sc3 = st.columns([1, 1, 4])
+    with _sc1:
+        if st.button("Speichern", type="primary", use_container_width=True, key="save_scores"):
+            save_scores(_edited)
+            st.toast("Scores gespeichert.", icon="✅")
+    with _sc2:
+        if st.button("Cache leeren", use_container_width=True, key="clear_thesis_cache"):
+            calc_ar_thesis.clear()
+            st.toast("Cache geleert.")
+
+    # ── AR berechnen ──────────────────────────────────────────────────────────
+    _valid = _edited.dropna(subset=["Ticker"]).copy()
+    _valid = _valid[_valid["Ticker"].str.strip().ne("")]
+
+    if len(_valid) < 2:
+        st.info("Mindestens 2 Unternehmen mit Ticker und Scores eintragen.")
+        st.stop()
+
+    divider("Abnormale Renditen")
+    st.markdown(
+        f"<p style='font-size:0.875rem;color:#6B7280'>"
+        f"<b>{len(_valid)}</b> Unternehmen · "
+        f"Schätzfenster: 60 Handelstage vor 24.02.2022 · "
+        f"AR = Return(24.02.) − Ø(Schätzfenster)</p>",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Abnormale Renditen berechnen", type="primary", key="calc_ar_btn"):
+        st.session_state["thesis_ar_ready"] = True
+
+    if not st.session_state.get("thesis_ar_ready"):
+        st.stop()
+
+    with st.spinner("Lade Preisdaten …"):
+        _tickers_t = tuple(_valid["Ticker"].str.strip().tolist())
+        _df_ar = calc_ar_thesis(_tickers_t)
+
+    if _df_ar.empty:
+        st.warning("Keine Preisdaten geladen. Ticker prüfen.")
+        st.stop()
+
+    # ── Merge ─────────────────────────────────────────────────────────────────
+    _valid = _valid.set_index("Ticker")
+    _valid.index = _valid.index.str.strip()
+    _df_merged = _valid.join(_df_ar, how="left")
+    _df_merged["Combined Score"] = (
+        _df_merged["Revenue Score"].fillna(0).astype(int)
+        + _df_merged["Operational Score"].fillna(0).astype(int)
+    )
+    _df_plot = _df_merged.dropna(subset=["AR"])
+    _n_ok   = len(_df_plot)
+    _n_miss = len(_df_merged) - _n_ok
+    st.caption(
+        f"{_n_ok} von {len(_df_merged)} Aktien mit AR · "
+        + (f"{_n_miss} ohne Preisdaten (Ticker prüfen)" if _n_miss else "alle geladen ✓")
+    )
+
+    # ── Scatter helper ────────────────────────────────────────────────────────
+    _SCORE_COLORS = {0: "#9CA3AF", 1: "#2563EB", 2: "#F59E0B", 3: "#DC2626"}
+    _SCORE_LABELS = {0: "0 – Keine", 1: "1 – Gering", 2: "2 – Signifikant", 3: "3 – Kritisch"}
+
+    def _make_scatter(df: pd.DataFrame, score_col: str, title: str) -> go.Figure:
+        rng    = np.random.default_rng(42)
+        jitter = rng.uniform(-0.12, 0.12, len(df))
+        x_j    = df[score_col].astype(float) + jitter
+        y_pct  = df["AR"] * 100
+
+        pt_colors = [_SCORE_COLORS.get(int(s), "#9CA3AF")
+                     for s in df[score_col].fillna(0).astype(int)]
+        hover = [
+            f"<b>{idx}</b><br>"
+            f"{row.get('Unternehmen', '')}<br>"
+            f"{score_col}: {int(row[score_col]) if pd.notna(row[score_col]) else '?'}<br>"
+            f"AR: {row['AR']*100:+.2f}%<br>"
+            f"Z: {row['Z-Score']:.2f}" if pd.notna(row.get("Z-Score")) else
+            f"<b>{idx}</b><br>AR: {row['AR']*100:+.2f}%"
+            for idx, row in df.iterrows()
+        ]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=x_j, y=y_pct, mode="markers",
+            marker=dict(color=pt_colors, size=10, opacity=0.85,
+                        line=dict(color="white", width=1.5)),
+            text=hover, hoverinfo="text", showlegend=False,
+        ))
+        if len(df) <= 30:
+            fig.add_trace(go.Scatter(
+                x=x_j, y=y_pct, mode="text",
+                text=df.index.tolist(),
+                textposition="top center",
+                textfont=dict(size=8, color="#6B7280"),
+                hoverinfo="skip", showlegend=False,
+            ))
+
+        # OLS trend line + R²
+        _xv = df[score_col].astype(float).values
+        _yv = y_pct.values
+        _m  = ~(np.isnan(_xv) | np.isnan(_yv))
+        if _m.sum() >= 4 and len(np.unique(_xv[_m])) >= 2:
+            coeffs  = np.polyfit(_xv[_m], _yv[_m], 1)
+            _xr     = np.linspace(_xv[_m].min(), _xv[_m].max(), 60)
+            _yr     = np.polyval(coeffs, _xr)
+            ss_res  = np.sum((_yv[_m] - np.polyval(coeffs, _xv[_m])) ** 2)
+            ss_tot  = np.sum((_yv[_m] - _yv[_m].mean()) ** 2)
+            r2      = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+            slope   = coeffs[0]
+            fig.add_trace(go.Scatter(
+                x=_xr, y=_yr, mode="lines",
+                line=dict(color="#94A3B8", dash="dash", width=1.5),
+                name=f"OLS  R²={r2:.3f}  β={slope:+.2f}",
+                showlegend=True,
+            ))
+
+        fig.add_hline(y=0, line_color="#E5E7EB", line_width=1)
+        fig.update_layout(
+            height=420, margin=dict(l=0, r=0, t=36, b=0),
+            title=dict(text=title, font=dict(size=13, color="#374151")),
+            xaxis=dict(
+                title="Exposure Score", tickvals=[0, 1, 2, 3],
+                ticktext=[_SCORE_LABELS[i] for i in range(4)],
+                gridcolor="#F3F4F6", zeroline=False,
+                tickfont=dict(size=10, color="#6B7280"),
+                range=[-0.5, 3.5],
+            ),
+            yaxis=dict(
+                title="Abnormale Rendite (%)", tickformat=".1f",
+                gridcolor="#F3F4F6", zeroline=False,
+                tickfont=dict(size=11, color="#6B7280"),
+            ),
+            plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+            legend=dict(orientation="h", y=1.06, x=1, xanchor="right",
+                        font=dict(size=10, color="#6B7280")),
+        )
+        return fig
+
+    # ── Gruppen-Balken helper ─────────────────────────────────────────────────
+    def _make_group_bar(df: pd.DataFrame, score_col: str, title: str) -> go.Figure:
+        grp = (df.groupby(score_col)["AR"]
+                 .agg(["mean", "sem", "count"])
+                 .reset_index())
+        grp["mean_pct"] = grp["mean"] * 100
+        grp["err_pct"]  = grp["sem"]  * 100 * 1.96
+        bar_colors = [_SCORE_COLORS.get(int(s), "#9CA3AF") for s in grp[score_col]]
+        fig = go.Figure(go.Bar(
+            x=[_SCORE_LABELS.get(int(s), str(s)) for s in grp[score_col]],
+            y=grp["mean_pct"],
+            error_y=dict(type="data", array=grp["err_pct"].tolist(),
+                         color="#9CA3AF", thickness=1.5, width=6),
+            marker_color=bar_colors,
+            text=[f"{v:+.2f}%<br>(n={n})" for v, n in zip(grp["mean_pct"], grp["count"])],
+            textposition="outside",
+            hovertemplate="%{x}<br>Ø AR: %{y:.3f}%<extra></extra>",
+        ))
+        fig.add_hline(y=0, line_color="#E5E7EB", line_width=1)
+        fig.update_layout(
+            height=340, margin=dict(l=0, r=0, t=36, b=0),
+            title=dict(text=title, font=dict(size=13, color="#374151")),
+            yaxis=dict(tickformat=".1f", gridcolor="#F3F4F6", zeroline=False,
+                       title="Ø Abnormale Rendite (%)", tickfont=dict(size=11, color="#6B7280")),
+            xaxis=dict(tickfont=dict(size=10, color="#374151")),
+            plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF", showlegend=False,
+        )
+        return fig
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    divider("Revenue Exposure vs. AR")
+    _pc1, _pc2 = st.columns(2)
+    with _pc1:
+        st.plotly_chart(
+            _make_scatter(_df_plot, "Revenue Score",
+                          "Revenue Score vs. Abnormale Rendite (24.02.2022)"),
+            use_container_width=True,
+        )
+    with _pc2:
+        st.plotly_chart(
+            _make_scatter(_df_plot, "Operational Score",
+                          "Operational Score vs. Abnormale Rendite (24.02.2022)"),
+            use_container_width=True,
+        )
+
+    divider("Durchschnittliche AR nach Score-Gruppe")
+    _gc1, _gc2 = st.columns(2)
+    with _gc1:
+        st.plotly_chart(
+            _make_group_bar(_df_plot, "Revenue Score", "Ø AR nach Revenue Score"),
+            use_container_width=True,
+        )
+    with _gc2:
+        st.plotly_chart(
+            _make_group_bar(_df_plot, "Operational Score", "Ø AR nach Operational Score"),
+            use_container_width=True,
+        )
+
+    # ── Statistik-Tabelle ─────────────────────────────────────────────────────
+    divider("Deskriptive Statistik nach Gruppe")
+    _stat_rows = []
+    for _sc_col in ["Revenue Score", "Operational Score"]:
+        for _sc_val, _grp in _df_plot.groupby(_sc_col):
+            _stat_rows.append({
+                "Dimension":   _sc_col,
+                "Score":       int(_sc_val),
+                "n":           len(_grp),
+                "Ø AR":        _grp["AR"].mean(),
+                "Median AR":   _grp["AR"].median(),
+                "Std AR":      _grp["AR"].std(),
+                "Min AR":      _grp["AR"].min(),
+                "Max AR":      _grp["AR"].max(),
+            })
+    if _stat_rows:
+        _df_stat = pd.DataFrame(_stat_rows)
+        _fmt_stat = {c: "{:+.4f}" for c in ["Ø AR", "Median AR", "Std AR", "Min AR", "Max AR"]}
+        st.dataframe(
+            _df_stat.style.format(_fmt_stat),
+            use_container_width=True, hide_index=True,
+            height=58 + len(_df_stat) * 35,
+        )
+
+    # ── Rohdaten-Tabelle ──────────────────────────────────────────────────────
+    divider("Rohdaten")
+    _show_cols = [c for c in [
+        "Unternehmen", "Sektor", "Revenue Score", "Operational Score",
+        "Combined Score", "Confidence", "AR", "Z-Score", "Return 24.02.", "Notizen",
+    ] if c in _df_merged.columns]
+    _df_raw_disp = _df_merged[_show_cols].sort_values("AR")
+    _fmt_raw = {"AR": "{:+.4f}", "Z-Score": "{:.2f}", "Return 24.02.": "{:+.4f}"}
+    _grad_raw = [c for c in ["AR", "Z-Score"] if c in _df_raw_disp.columns]
+    st.dataframe(
+        _df_raw_disp.style
+            .format(_fmt_raw, na_rep="—")
+            .background_gradient(subset=_grad_raw, cmap="RdYlGn", vmin=-0.08, vmax=0.08),
+        use_container_width=True,
+        height=min(600, 58 + len(_df_raw_disp) * 35),
+    )
+
+    # ── Excel-Export ──────────────────────────────────────────────────────────
+    divider("Excel-Export")
+    _thesis_buf = io.BytesIO()
+    with pd.ExcelWriter(_thesis_buf, engine="openpyxl") as _xw:
+        _df_merged.reset_index().rename(columns={"index": "Ticker"}).to_excel(
+            _xw, sheet_name="Rohdaten", index=False
+        )
+        if _stat_rows:
+            _df_stat.to_excel(_xw, sheet_name="Deskriptive Statistik", index=False)
+        for _sc_col in ["Revenue Score", "Operational Score"]:
+            _gdf = (
+                _df_plot.groupby(_sc_col)["AR"]
+                .agg(["mean", "std", "sem", "count", "min", "max"])
+                .reset_index()
+            )
+            _gdf.to_excel(
+                _xw,
+                sheet_name=f"Gruppe {'Rev' if 'Rev' in _sc_col else 'Op'}",
+                index=False,
+            )
+
+    _today_th = date.today()
+    excel_export_card(
+        _thesis_buf,
+        f"thesis_analyse_{_today_th}.xlsx",
+        len(_df_merged),
+        _today_th, _today_th,
+        "Rohdaten · Deskriptive Statistik · Gruppen Revenue · Gruppen Operational",
+    )
