@@ -8,10 +8,18 @@ Start:
 import importlib
 import io
 import json
+import os
 import subprocess
 import sys
 from datetime import date
 from pathlib import Path
+
+try:
+    import anthropic as _anthropic_mod
+    _ANTHROPIC_OK = True
+except ImportError:
+    _anthropic_mod = None
+    _ANTHROPIC_OK = False
 
 import numpy as np
 import pandas as pd
@@ -465,6 +473,82 @@ def metric_card(col, label: str, value: float, sub: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Russland-Analyse — Systemprompt & API-Wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+_RUSSIA_SYS = """\
+You are a financial research assistant.
+
+Task:
+Assess the PRE-WAR Russian exposure of the company the user names.
+
+Important:
+Use only information that was publicly available BEFORE 24 February 2022.
+
+Preferred sources:
+1. Annual Report 2021
+2. Annual Report 2020
+3. Investor presentations published before 24 February 2022
+4. Company filings published before 24 February 2022
+
+Ignore:
+- Information published after 24 February 2022
+- Discussions of sanctions impacts
+- Discussions of the company withdrawal from Russia
+- Post-war write-offs
+
+Goal:
+Measure how economically dependent the company was on Russia before the invasion.
+
+Extract:
+
+A. Revenue Exposure
+- Revenue generated in Russia
+- Revenue share (%)
+- Whether Russia is listed as a key market
+
+B. Asset Exposure
+- Factories, stores, subsidiaries, joint ventures, investments
+
+C. Operational Exposure
+- Number of employees in Russia
+- Number of sites in Russia
+
+D. Supply Chain Exposure
+- Dependence on Russian commodities, suppliers, or energy
+
+E. Strategic Importance
+- Was Russia identified as a growth market?
+- Was Russia among the company's major geographic markets?
+
+For every finding provide:
+- exact source and page number
+- quotation or precise paraphrase
+
+Format your response in clean Markdown with section headers (## A. Revenue Exposure, etc.).
+Output only factual information. Do not calculate an exposure score. Do not discuss post-war effects.
+If no reliable pre-war data is available for a section, explicitly state "Keine verlässlichen Daten verfügbar."\
+"""
+
+
+def run_russia_analysis(api_key: str, company: str) -> str:
+    """Call Claude API to assess pre-war Russian exposure of a company."""
+    client = _anthropic_mod.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=4096,
+        system=_RUSSIA_SYS,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Assess the PRE-WAR Russian exposure of: **{company}**\n\n"
+                "Use ONLY information publicly available before 24 February 2022."
+            ),
+        }],
+    )
+    return msg.content[0].text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sidebar — nur Zeitraum & Darstellung
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -512,7 +596,7 @@ with _hdr_r:
 # ─────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────────────────────────────────────
-tab_markt, tab_aktien = st.tabs(["Indizes", "Einzelaktien"])
+tab_markt, tab_aktien, tab_russia = st.tabs(["Indizes", "Einzelaktien", "Russland-Analyse"])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1010,3 +1094,151 @@ with tab_aktien:
                 fname = f"stoxx_{section_label.split()[1].lower()}_{exp_start}_{exp_end}.xlsx"
                 excel_export_card(buf, fname, len(tickers_exp_ok), exp_start, exp_end,
                                   "3 Sheets: Preise · Renditen · Performance")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 3 — RUSSLAND-ANALYSE
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_russia:
+
+    # ── Info-Banner ──────────────────────────────────────────────────────────
+    st.markdown(
+        "<div style='background:#FEF3C7;border:1px solid #FDE68A;border-radius:10px;"
+        "padding:0.85rem 1.1rem;margin-bottom:1.25rem;display:flex;gap:0.75rem;"
+        "align-items:flex-start'>"
+        "<div style='font-size:1rem;flex-shrink:0;margin-top:1px'>&#9888;&#65039;</div>"
+        "<div>"
+        "<div style='font-size:0.84rem;font-weight:600;color:#92400E'>"
+        "Vorkriegs-Russland-Exposition &nbsp;·&nbsp; Stichtag: 24. Feb 2022</div>"
+        "<div style='font-size:0.78rem;color:#78350F;margin-top:3px;line-height:1.5'>"
+        "Analysiert ausschliesslich oeffentlich verfuegbare Informationen VOR Kriegsbeginn "
+        "(Geschaeftsberichte 2020/2021, Investorenpresentationen). "
+        "Post-War-Effekte, Sanktionen und Unternehmensrueckzuege werden ignoriert."
+        "</div></div></div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── API Key ──────────────────────────────────────────────────────────────
+    _env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    _exp_label = (
+        "API Key &nbsp;·&nbsp; aus Umgebungsvariable geladen"
+        if _env_key else "API Key einrichten"
+    )
+    with st.expander(_exp_label, expanded=not bool(_env_key)):
+        if not _env_key:
+            st.markdown(
+                "<div style='font-size:0.8rem;color:#6B7280;margin-bottom:0.6rem'>"
+                "Kostenlosen Key erstellen: "
+                "<a href='https://console.anthropic.com/settings/keys' target='_blank' "
+                "style='color:#2563EB;font-weight:500'>console.anthropic.com</a> "
+                "&nbsp;→&nbsp; API Keys &nbsp;→&nbsp; Create Key"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        _key_input = st.text_input(
+            "Key",
+            type="password",
+            placeholder="sk-ant-api03-..." if not _env_key else "(aus ANTHROPIC_API_KEY)",
+            label_visibility="collapsed",
+            key="ant_key",
+        )
+    _api_key = _key_input.strip() if _key_input else _env_key
+
+    # ── Pakete / Key prüfen ──────────────────────────────────────────────────
+    if not _ANTHROPIC_OK:
+        st.error(
+            "`anthropic` Paket nicht installiert. "
+            "Bitte `pip install anthropic` ausfuehren und App neu starten."
+        )
+    elif not _api_key:
+        st.info("Bitte zuerst einen Anthropic API Key eingeben (siehe oben).")
+    else:
+        # ── Unternehmensauswahl ──────────────────────────────────────────────
+        divider("Unternehmen auswählen")
+        _inp_mode = st.radio(
+            "Eingabe",
+            ["Firmenname eingeben", "Aus STOXX 600 wählen"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="russia_inp_mode",
+        )
+
+        _company_name = ""
+        _inp_col, _ = st.columns([3, 2])
+        with _inp_col:
+            if _inp_mode == "Firmenname eingeben":
+                _company_name = st.text_input(
+                    "Firmenname",
+                    placeholder="z.B. Volkswagen AG, Shell plc, BASF SE, Renault",
+                    label_visibility="collapsed",
+                    key="russia_company_text",
+                )
+            else:
+                _ticker_sel = st.selectbox(
+                    "STOXX 600 Ticker",
+                    options=["— bitte wählen —"] + sorted(STOXX600_TICKERS),
+                    label_visibility="collapsed",
+                    key="russia_ticker_sel",
+                )
+                if _ticker_sel != "— bitte wählen —":
+                    _company_name = _ticker_sel
+
+        # ── Buttons & Analyse ────────────────────────────────────────────────
+        if "russia_cache" not in st.session_state:
+            st.session_state["russia_cache"] = {}
+
+        _cache_key = f"russia_{_company_name.strip().lower()}"
+        _has_result = _cache_key in st.session_state["russia_cache"]
+
+        if _company_name:
+            _btn_c1, _btn_c2 = st.columns([3, 1])
+            with _btn_c1:
+                _run = st.button(
+                    "Analyse starten",
+                    type="primary",
+                    use_container_width=True,
+                    key="russia_run",
+                )
+            with _btn_c2:
+                if _has_result:
+                    if st.button("Neu analysieren", use_container_width=True, key="russia_clear"):
+                        del st.session_state["russia_cache"][_cache_key]
+                        st.rerun()
+
+            if _run:
+                try:
+                    with st.spinner(
+                        f"Claude analysiert Russland-Exposition von **{_company_name}** "
+                        f"(Basis: Geschäftsberichte vor Feb 2022) …"
+                    ):
+                        _result = run_russia_analysis(_api_key, _company_name)
+                    st.session_state["russia_cache"][_cache_key] = _result
+                    st.rerun()
+                except Exception as _exc:
+                    st.error(f"API-Fehler: {_exc}")
+
+            if _has_result:
+                _result = st.session_state["russia_cache"][_cache_key]
+                divider(f"Analyse: {_company_name}")
+                st.markdown(_result)
+                divider()
+                _dl_col, _ = st.columns([2, 3])
+                with _dl_col:
+                    st.download_button(
+                        label="Analyse herunterladen (.md)",
+                        data=_result.encode("utf-8"),
+                        file_name=(
+                            f"russland_analyse_"
+                            f"{_company_name.replace(' ', '_').replace('/', '_')}.md"
+                        ),
+                        mime="text/markdown",
+                        type="primary",
+                        use_container_width=True,
+                    )
+        else:
+            st.markdown(
+                "<p style='color:#9CA3AF;font-size:0.875rem;margin-top:0.5rem'>"
+                "Unternehmensname eingeben oder Ticker auswählen, "
+                "dann auf &laquo;Analyse starten&raquo; klicken.</p>",
+                unsafe_allow_html=True,
+            )
