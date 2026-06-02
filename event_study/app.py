@@ -9,6 +9,7 @@ import importlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import date
@@ -533,6 +534,23 @@ def calc_ar_thesis(tickers: tuple[str, ...]) -> pd.DataFrame:
     return pd.DataFrame(rows).set_index("Ticker") if rows else pd.DataFrame()
 
 
+def parse_russia_scores(text: str) -> dict:
+    """Extract scores from AI response — machine-readable block first, table as fallback."""
+    rev  = re.search(r'REVENUE_SCORE:\s*([0-3])', text)
+    ops  = re.search(r'OPERATIONAL_SCORE:\s*([0-3])', text)
+    conf = re.search(r'CONFIDENCE:\s*(High|Medium|Low)', text, re.IGNORECASE)
+    # Fallback: parse from markdown table / inline text
+    if not rev:
+        rev  = re.search(r'Revenue Exposure Score[^\d]*([0-3])', text)
+    if not ops:
+        ops  = re.search(r'Operational Exposure Score[^\d]*([0-3])', text)
+    return {
+        "revenue_score":      int(rev.group(1))           if rev  else None,
+        "operational_score":  int(ops.group(1))           if ops  else None,
+        "confidence":         conf.group(1).capitalize()  if conf else None,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Russland-Analyse — Systemprompt & API-Wrapper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -609,7 +627,15 @@ After the table, add a brief paragraph explaining how the scores were assigned a
 Confidence Level definitions:
 - High = based on quantitative disclosures or multiple reliable sources.
 - Medium = based on credible qualitative evidence but limited quantitative detail.
-- Low = based on indirect evidence, estimates, or incomplete information.\
+- Low = based on indirect evidence, estimates, or incomplete information.
+
+IMPORTANT: At the very end of your response, always append this exact block (required for automated processing — never skip or modify the format):
+
+```scores
+REVENUE_SCORE: [0|1|2|3]
+OPERATIONAL_SCORE: [0|1|2|3]
+CONFIDENCE: [High|Medium|Low]
+```\
 """
 
 
@@ -1256,15 +1282,22 @@ with tab_russia:
         )
 
         _company_name = ""
+        _ticker_for_ar = ""
         _inp_col, _ = st.columns([3, 2])
         with _inp_col:
             if _inp_mode == "Firmenname eingeben":
                 _company_name = st.text_input(
                     "Firmenname",
-                    placeholder="z.B. Volkswagen AG, Shell plc, BASF SE, Renault",
+                    placeholder="z.B. Renault, Volkswagen AG, BASF SE",
                     label_visibility="collapsed",
                     key="russia_company_text",
                 )
+                _ticker_for_ar = st.text_input(
+                    "Ticker",
+                    placeholder="Ticker für AR-Berechnung, z.B. RNO.PA · VOW.DE · BAS.DE",
+                    label_visibility="collapsed",
+                    key="russia_ticker_text",
+                ).strip()
             else:
                 _ticker_sel = st.selectbox(
                     "STOXX 600 Ticker",
@@ -1274,34 +1307,32 @@ with tab_russia:
                 )
                 if _ticker_sel != "— bitte wählen —":
                     _company_name = _ticker_sel
+                    _ticker_for_ar = _ticker_sel
 
         # ── Buttons & Analyse ────────────────────────────────────────────────
         if "russia_cache" not in st.session_state:
             st.session_state["russia_cache"] = {}
 
-        _cache_key = f"russia_{_company_name.strip().lower()}"
-        _has_result = _cache_key in st.session_state["russia_cache"]
+        _cache_key   = f"russia_{_company_name.strip().lower()}"
+        _has_result  = _cache_key in st.session_state["russia_cache"]
 
         if _company_name:
             _btn_c1, _btn_c2 = st.columns([3, 1])
             with _btn_c1:
                 _run = st.button(
-                    "Analyse starten",
-                    type="primary",
-                    use_container_width=True,
-                    key="russia_run",
+                    "Analyse starten", type="primary",
+                    use_container_width=True, key="russia_run",
                 )
             with _btn_c2:
                 if _has_result:
-                    if st.button("Neu analysieren", use_container_width=True, key="russia_clear"):
+                    if st.button("Neu", use_container_width=True, key="russia_clear"):
                         del st.session_state["russia_cache"][_cache_key]
                         st.rerun()
 
             if _run:
                 try:
                     with st.spinner(
-                        f"Claude analysiert Russland-Exposition von **{_company_name}** "
-                        f"(Basis: Geschäftsberichte vor Feb 2022) …"
+                        f"Analysiere Russland-Exposition von **{_company_name}** …"
                     ):
                         _result = run_russia_analysis(_api_key, _company_name)
                     st.session_state["russia_cache"][_cache_key] = _result
@@ -1310,9 +1341,110 @@ with tab_russia:
                     st.error(f"API-Fehler: {_exc}")
 
             if _has_result:
-                _result = st.session_state["russia_cache"][_cache_key]
-                divider(f"Analyse: {_company_name}")
-                st.markdown(_result)
+                _result      = st.session_state["russia_cache"][_cache_key]
+                _parsed      = parse_russia_scores(_result)
+                _rev_sc      = _parsed.get("revenue_score")
+                _ops_sc      = _parsed.get("operational_score")
+                _conf        = _parsed.get("confidence") or ""
+                _eff_ticker  = _ticker_for_ar or (
+                    _company_name if _inp_mode != "Firmenname eingeben" else ""
+                )
+
+                # ── AR berechnen ─────────────────────────────────────────
+                _ar_val = _z_val = None
+                if _eff_ticker:
+                    with st.spinner("Berechne Abnormale Rendite …"):
+                        _ar_df = calc_ar_thesis((_eff_ticker.strip(),))
+                    if not _ar_df.empty and _eff_ticker.strip() in _ar_df.index:
+                        _ar_val = float(_ar_df.loc[_eff_ticker.strip(), "AR"])
+                        _z_val  = float(_ar_df.loc[_eff_ticker.strip(), "Z-Score"])
+
+                # ── Ergebnis-Karte ────────────────────────────────────────
+                _SC_COLOR = {0: "#9CA3AF", 1: "#3B82F6", 2: "#F59E0B", 3: "#DC2626"}
+                _SC_DESC  = {0: "Keine  <1 %", 1: "Gering  1–5 %",
+                             2: "Moderat  5–10 %", 3: "Hoch  >10 %"}
+                _OP_DESC  = {0: "Keine", 1: "Begrenzt",
+                             2: "Signifikant", 3: "Kritisch"}
+
+                def _kpi(label, val, sub, color):
+                    return (
+                        f"<div style='text-align:center;padding:0.6rem 0.25rem'>"
+                        f"<div style='font-size:0.6rem;font-weight:700;color:#9CA3AF;"
+                        f"text-transform:uppercase;letter-spacing:0.07em;"
+                        f"margin-bottom:5px'>{label}</div>"
+                        f"<div style='font-size:1.8rem;font-weight:800;color:{color};"
+                        f"line-height:1;letter-spacing:-0.02em'>{val}</div>"
+                        f"<div style='font-size:0.7rem;color:#6B7280;margin-top:4px'>{sub}</div>"
+                        f"</div>"
+                    )
+
+                _cells = ""
+                if _rev_sc is not None:
+                    _cells += _kpi("Revenue Score", f"{_rev_sc}/3",
+                                   _SC_DESC.get(_rev_sc, ""), _SC_COLOR.get(_rev_sc, "#9CA3AF"))
+                    _cells += _kpi("Op. Score", f"{(_ops_sc or 0)}/3",
+                                   _OP_DESC.get(_ops_sc or 0, ""), _SC_COLOR.get(_ops_sc or 0, "#9CA3AF"))
+                if _ar_val is not None:
+                    _ar_clr  = "#16A34A" if _ar_val >= 0 else "#DC2626"
+                    _z_sig   = ("Extrem" if abs(_z_val) > 3
+                                else "Signifikant" if abs(_z_val) > 2 else "Normal")
+                    _cells  += _kpi("AR  24.02.2022", f"{_ar_val*100:+.1f}%",
+                                    _eff_ticker, _ar_clr)
+                    _cells  += _kpi("Z-Score", f"{_z_val:.2f}", _z_sig, _ar_clr)
+                if _conf:
+                    _cells += _kpi("Confidence", _conf, "", "#6B7280")
+
+                if _cells:
+                    st.markdown(
+                        f"<div style='background:#F8FAFC;border:1px solid #E2E8F0;"
+                        f"border-radius:12px;padding:0.75rem 1rem;margin:0.75rem 0;"
+                        f"display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr))'>"
+                        f"{_cells}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # ── Zur Thesis hinzufügen ─────────────────────────────────
+                if _rev_sc is not None:
+                    _thesis_label = (
+                        f"Zur Thesis-Analyse hinzufügen"
+                        + (" · bereits vorhanden" if (
+                            _eff_ticker and _eff_ticker in
+                            load_scores()["Ticker"].values
+                        ) else "")
+                    )
+                    if st.button(_thesis_label, type="primary",
+                                 use_container_width=False, key="add_thesis"):
+                        _df_ex = load_scores()
+                        _tk    = _eff_ticker or _company_name
+                        _new   = {
+                            "Ticker":            _tk,
+                            "Unternehmen":       _company_name
+                                                 if _inp_mode == "Firmenname eingeben"
+                                                 else "",
+                            "Sektor":            "",
+                            "Revenue Score":     _rev_sc,
+                            "Operational Score": _ops_sc or 0,
+                            "Confidence":        _conf,
+                            "Notizen":           "",
+                        }
+                        _mask = _df_ex["Ticker"] == _tk
+                        if _mask.any():
+                            for _k, _v in _new.items():
+                                _df_ex.loc[_mask, _k] = _v
+                        else:
+                            _df_ex = pd.concat(
+                                [_df_ex, pd.DataFrame([_new])], ignore_index=True
+                            )
+                        save_scores(_df_ex)
+                        st.toast(f"{_tk} gespeichert — jetzt im Thesis-Analyse Tab.", icon="✅")
+
+                # ── Vollständige Analyse ──────────────────────────────────
+                divider(f"Vollständige Analyse: {_company_name}")
+                # Hide the machine-readable scores block from display
+                _display_result = re.sub(
+                    r'```scores\n.*?```', '', _result, flags=re.DOTALL
+                ).strip()
+                st.markdown(_display_result)
                 divider()
                 _dl_col, _ = st.columns([2, 3])
                 with _dl_col:
@@ -1324,14 +1456,12 @@ with tab_russia:
                             f"{_company_name.replace(' ', '_').replace('/', '_')}.md"
                         ),
                         mime="text/markdown",
-                        type="primary",
                         use_container_width=True,
                     )
         else:
             st.markdown(
                 "<p style='color:#9CA3AF;font-size:0.875rem;margin-top:0.5rem'>"
-                "Unternehmensname eingeben oder Ticker auswählen, "
-                "dann auf &laquo;Analyse starten&raquo; klicken.</p>",
+                "Firmenname + Ticker eingeben oder Ticker aus STOXX 600 wählen.</p>",
                 unsafe_allow_html=True,
             )
 
