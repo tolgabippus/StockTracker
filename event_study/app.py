@@ -1122,7 +1122,10 @@ with tab_russia:
     )
 
     # ── API Key ──────────────────────────────────────────────────────────────
-    _env_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    _env_key = (
+        os.environ.get("DEEPSEEK_API_KEY", "")
+        or st.secrets.get("DEEPSEEK_API_KEY", "")
+    )
     _exp_label = (
         "API Key &nbsp;·&nbsp; aus Umgebungsvariable geladen"
         if _env_key else "DeepSeek API Key einrichten"

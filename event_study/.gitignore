@@ -1,0 +1,9 @@
+# Streamlit secrets — never commit
+.streamlit/secrets.toml
+
+# Data / output
+data/stoxx600_full_tickers.json
+output/
+__pycache__/
+*.pyc
+.env
