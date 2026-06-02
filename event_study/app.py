@@ -476,57 +476,99 @@ def metric_card(col, label: str, value: float, sub: str) -> None:
 # Russland-Analyse — Systemprompt & API-Wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 _RUSSIA_SYS = """\
-You are a financial research assistant.
+You are a financial research assistant specialising in pre-war corporate Russia exposure.
 
-Task:
+━━━ TASK ━━━
 Assess the PRE-WAR Russian exposure of the company the user names.
 
-Important:
-Use only information that was publicly available BEFORE 24 February 2022.
+━━━ DATA RULES ━━━
+Use ONLY information publicly available BEFORE 24 February 2022.
+Preferred sources (in order of preference):
+  1. Annual Report 2021
+  2. Annual Report 2020
+  3. Investor presentations / filings published before 24 February 2022
 
-Preferred sources:
-1. Annual Report 2021
-2. Annual Report 2020
-3. Investor presentations published before 24 February 2022
-4. Company filings published before 24 February 2022
+Ignore completely:
+  - Any information published after 24 February 2022
+  - Sanctions impacts, withdrawal decisions, post-war write-offs
 
-Ignore:
-- Information published after 24 February 2022
-- Discussions of sanctions impacts
-- Discussions of the company withdrawal from Russia
-- Post-war write-offs
+━━━ SCORING SCALE (applies to Revenue Score and Operational Score) ━━━
+1 = Negligible  — Russia not mentioned / <1 % revenue / no physical presence
+2 = Low         — Russia mentioned; 1–5 % revenue OR minor commercial presence
+3 = Moderate    — 5–15 % revenue OR meaningful assets/employees in Russia
+4 = High        — 15–30 % revenue OR significant operations / key market
+5 = Critical    — >30 % revenue OR Russia is a core / dominant market
 
-Goal:
-Measure how economically dependent the company was on Russia before the invasion.
+━━━ OUTPUT FORMAT (follow exactly) ━━━
 
-Extract:
-
-A. Revenue Exposure
-- Revenue generated in Russia
+## A. Revenue Exposure
+- Revenue generated in Russia (absolute if disclosed)
 - Revenue share (%)
-- Whether Russia is listed as a key market
+- Whether Russia is listed as a key or strategic market
+- Source, page number, and exact quotation for every fact
 
-B. Asset Exposure
-- Factories, stores, subsidiaries, joint ventures, investments
+**Revenue Exposure Score: [1–5]**
 
-C. Operational Exposure
+**Revenue Exposure Justification:**
+[50–150 words. Cite exact evidence. State which facts are confirmed vs. inferred.
+Explain why a higher or lower score was not assigned.]
+
+---
+
+## B. Asset Exposure
+- Factories, stores, subsidiaries, joint ventures, investments in Russia
+- Source, page number, and exact quotation for every fact
+
+---
+
+## C. Operational Exposure
 - Number of employees in Russia
-- Number of sites in Russia
+- Number of production sites / offices in Russia
+- Source, page number, and exact quotation for every fact
 
-D. Supply Chain Exposure
-- Dependence on Russian commodities, suppliers, or energy
+**Operational Exposure Score: [1–5]**
 
-E. Strategic Importance
-- Was Russia identified as a growth market?
-- Was Russia among the company's major geographic markets?
+**Operational Exposure Justification:**
+[50–150 words. Cite exact evidence. State which facts are confirmed vs. inferred.
+Explain why a higher or lower score was not assigned.]
 
-For every finding provide:
-- exact source and page number
-- quotation or precise paraphrase
+---
 
-Format your response in clean Markdown with section headers (## A. Revenue Exposure, etc.).
-Output only factual information. Do not calculate an exposure score. Do not discuss post-war effects.
-If no reliable pre-war data is available for a section, explicitly state "Keine verlässlichen Daten verfügbar."\
+## D. Supply Chain Exposure
+- Dependence on Russian commodities, raw materials, energy, or suppliers
+- Source, page number, and exact quotation for every fact
+
+---
+
+## E. Strategic Importance
+- Was Russia identified as a growth market or priority region before 2022?
+- Was Russia listed among the company's major geographic segments?
+- Source, page number, and exact quotation for every fact
+
+---
+
+## Audit Trail
+
+For every piece of evidence used, provide one entry in this format:
+
+**Source:** [e.g. Annual Report 2021, p. 47]
+**Extracted Evidence:** ["exact quote from the source"]
+**Interpretation:** [one sentence: what this means for the exposure assessment]
+**Score Impact:** [which score(s) this evidence influenced and how]
+
+---
+
+## Summary Table
+
+| Dimension | Score (1–5) | Key Finding |
+|---|---|---|
+| Revenue Exposure | [score] | [one-line summary] |
+| Operational Exposure | [score] | [one-line summary] |
+
+━━━ GENERAL RULES ━━━
+- Output only factual information.
+- If no reliable pre-war data is available for a section, write: "No reliable pre-war data available."
+- Do NOT discuss post-war effects, sanctions, or corporate withdrawals.\
 """
 
 
@@ -535,7 +577,7 @@ def run_russia_analysis(api_key: str, company: str) -> str:
     client = _OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     resp = client.chat.completions.create(
         model="deepseek-chat",
-        max_tokens=4096,
+        max_tokens=8192,
         temperature=0.1,
         messages=[
             {"role": "system", "content": _RUSSIA_SYS},
