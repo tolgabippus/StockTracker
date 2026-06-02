@@ -539,15 +539,22 @@ def parse_russia_scores(text: str) -> dict:
     rev  = re.search(r'REVENUE_SCORE:\s*([0-3])', text)
     ops  = re.search(r'OPERATIONAL_SCORE:\s*([0-3])', text)
     conf = re.search(r'CONFIDENCE:\s*(High|Medium|Low)', text, re.IGNORECASE)
+    tkr  = re.search(r'TICKER:\s*([A-Z0-9][A-Z0-9\.\-]{0,19})', text)
     # Fallback: parse from markdown table / inline text
     if not rev:
         rev  = re.search(r'Revenue Exposure Score[^\d]*([0-3])', text)
     if not ops:
         ops  = re.search(r'Operational Exposure Score[^\d]*([0-3])', text)
+    _ticker = None
+    if tkr:
+        _t = tkr.group(1).strip()
+        if _t.upper() != "UNKNOWN":
+            _ticker = _t
     return {
         "revenue_score":      int(rev.group(1))           if rev  else None,
         "operational_score":  int(ops.group(1))           if ops  else None,
         "confidence":         conf.group(1).capitalize()  if conf else None,
+        "ticker":             _ticker,
     }
 
 
@@ -635,6 +642,7 @@ IMPORTANT: At the very end of your response, always append this exact block (req
 REVENUE_SCORE: [0|1|2|3]
 OPERATIONAL_SCORE: [0|1|2|3]
 CONFIDENCE: [High|Medium|Low]
+TICKER: [correct yfinance ticker for the primary stock exchange listing, e.g. RNO.PA, VOW3.DE, BP.L, NESN.SW, ENI.MI — if genuinely unknown write UNKNOWN]
 ```\
 """
 
@@ -1282,7 +1290,6 @@ with tab_russia:
         )
 
         _company_name = ""
-        _ticker_for_ar = ""
         _inp_col, _ = st.columns([3, 2])
         with _inp_col:
             if _inp_mode == "Firmenname eingeben":
@@ -1292,12 +1299,6 @@ with tab_russia:
                     label_visibility="collapsed",
                     key="russia_company_text",
                 )
-                _ticker_for_ar = st.text_input(
-                    "Ticker",
-                    placeholder="Ticker für AR-Berechnung, z.B. RNO.PA · VOW.DE · BAS.DE",
-                    label_visibility="collapsed",
-                    key="russia_ticker_text",
-                ).strip()
             else:
                 _ticker_sel = st.selectbox(
                     "STOXX 600 Ticker",
@@ -1307,7 +1308,6 @@ with tab_russia:
                 )
                 if _ticker_sel != "— bitte wählen —":
                     _company_name = _ticker_sel
-                    _ticker_for_ar = _ticker_sel
 
         # ── Buttons & Analyse ────────────────────────────────────────────────
         if "russia_cache" not in st.session_state:
@@ -1346,7 +1346,8 @@ with tab_russia:
                 _rev_sc      = _parsed.get("revenue_score")
                 _ops_sc      = _parsed.get("operational_score")
                 _conf        = _parsed.get("confidence") or ""
-                _eff_ticker  = _ticker_for_ar or (
+                _ai_ticker   = _parsed.get("ticker") or ""
+                _eff_ticker  = _ai_ticker or (
                     _company_name if _inp_mode != "Firmenname eingeben" else ""
                 )
 
@@ -1461,7 +1462,7 @@ with tab_russia:
         else:
             st.markdown(
                 "<p style='color:#9CA3AF;font-size:0.875rem;margin-top:0.5rem'>"
-                "Firmenname + Ticker eingeben oder Ticker aus STOXX 600 wählen.</p>",
+                "Firmenname eingeben oder Ticker aus STOXX 600 wählen.</p>",
                 unsafe_allow_html=True,
             )
 
