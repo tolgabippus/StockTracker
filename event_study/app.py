@@ -356,8 +356,9 @@ REGION_COLORS = {
     "Australien": "#D97706",
     "Europa":     "#2563EB",
 }
-EVENT_DATE = pd.Timestamp("2022-02-24")
-EVENT_STR  = "2022-02-24"
+EVENT_DATE        = pd.Timestamp("2022-02-24")
+EVENT_STR         = "2022-02-24"
+_BENCHMARK_TICKER = "EXSA.DE"   # iShares STOXX Europe 600 ETF — market proxy
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -479,15 +480,15 @@ def metric_card(col, label: str, value: float, sub: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def load_scores() -> pd.DataFrame:
     """Load Russia exposure scores from JSON file."""
-    _empty = pd.DataFrame({
-        "Ticker":             pd.Series(dtype=str),
-        "Unternehmen":        pd.Series(dtype=str),
-        "Sektor":             pd.Series(dtype=str),
-        "Revenue Score":      pd.Series(dtype=int),
-        "Operational Score":  pd.Series(dtype=int),
-        "Confidence":         pd.Series(dtype=str),
-        "Notizen":            pd.Series(dtype=str),
-    })
+    _str_cols = [
+        "Ticker", "Unternehmen", "Sektor", "Confidence",
+        "Revenue Evidence", "Revenue Justification",
+        "Operational Evidence", "Operational Justification",
+        "Audit Trail", "Notizen",
+    ]
+    _empty = pd.DataFrame({c: pd.Series(dtype=str) for c in _str_cols}
+                          | {"Revenue Score": pd.Series(dtype=int),
+                             "Operational Score": pd.Series(dtype=int)})
     if not _SCORES_PATH.exists():
         return _empty
     try:
@@ -496,6 +497,9 @@ def load_scores() -> pd.DataFrame:
         for col in ["Revenue Score", "Operational Score"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+        for col in _str_cols:
+            if col not in df.columns:
+                df[col] = ""
         return df
     except Exception:
         return _empty
@@ -511,50 +515,169 @@ def save_scores(df: pd.DataFrame) -> None:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def calc_ar_thesis(tickers: tuple[str, ...]) -> pd.DataFrame:
-    """Download prices and compute ARs for the event date (fixed window 2020–2022)."""
-    raw = download_batch(tickers, "2020-01-01", "2022-04-01")
+    """Compute AR/CAR using Mean-Adjusted and Market Model; CAR[-1,+1], [-3,+3], 30-day."""
+    all_dl = tuple(dict.fromkeys(list(tickers) + [_BENCHMARK_TICKER]))
+    raw = download_batch(all_dl, "2019-06-01", "2022-04-30")
     if raw.empty:
         return pd.DataFrame()
+
+    r_all = np.log(raw / raw.shift(1)).dropna(how="all")
+    r_mkt = r_all[_BENCHMARK_TICKER].dropna() if _BENCHMARK_TICKER in r_all.columns else None
+
+    def _get_win(series: pd.Series, off_s: int, off_e: int) -> pd.Series:
+        """Slice [off_s, off_e] trading-day offsets around EVENT_DATE."""
+        on_or_after = series.index[series.index >= EVENT_DATE]
+        if len(on_or_after) == 0:
+            return pd.Series(dtype=float)
+        ep = series.index.get_loc(on_or_after[0])
+        s, e = max(0, ep + off_s), min(len(series), ep + off_e + 1)
+        return series.iloc[s:e] if s < e else pd.Series(dtype=float)
+
     rows = []
     for ticker in tickers:
-        if ticker not in raw.columns:
+        if ticker not in r_all.columns:
             continue
-        col = raw[ticker].dropna()
-        if len(col) < 20:
+        r_i = r_all[ticker].dropna()
+        if len(r_i) < 40:
             continue
-        r = np.log(col / col.shift(1)).dropna()
-        ev = r.index[(r.index >= EVENT_DATE) & (r.index <= EVENT_DATE + pd.Timedelta(days=4))]
-        r_event = float(r.loc[ev[0]]) if len(ev) else np.nan
-        pre   = r[r.index < EVENT_DATE].tail(60)
-        r_mu  = pre.mean()     if len(pre) > 10 else np.nan
-        r_sig = pre.std(ddof=1) if len(pre) > 10 else np.nan
-        ar = (r_event - r_mu) if not (np.isnan(r_event) or np.isnan(r_mu)) else np.nan
-        z  = (ar / r_sig)     if (r_sig and r_sig > 0 and not np.isnan(ar)) else np.nan
-        rows.append({"Ticker": ticker, "AR": ar, "Z-Score": z, "Return 24.02.": r_event})
+
+        # Estimation window: up to 120 obs, ending 11 calendar days before event
+        pre_idx = r_i.index[r_i.index < EVENT_DATE - pd.Timedelta(days=11)]
+        if len(pre_idx) < 30:
+            continue
+        est_idx  = pre_idx[-120:]
+        r_i_est  = r_i.loc[est_idx]
+        mu_ma    = float(r_i_est.mean())
+        sigma_ma = float(r_i_est.std(ddof=1)) if len(r_i_est) > 1 else np.nan
+
+        # Market-Model OLS: R_i = α + β·R_m + ε
+        alpha_mm = beta_mm = sigma_mm = np.nan
+        if r_mkt is not None:
+            rm_est = r_mkt.reindex(est_idx).dropna()
+            ri_est = r_i_est.reindex(rm_est.index).dropna()
+            rm_est = rm_est.loc[ri_est.index]
+            if len(ri_est) >= 20:
+                X = np.column_stack([np.ones(len(rm_est)), rm_est.values])
+                c, *_ = np.linalg.lstsq(X, ri_est.values, rcond=None)
+                alpha_mm, beta_mm = float(c[0]), float(c[1])
+                resid    = ri_est.values - (alpha_mm + beta_mm * rm_est.values)
+                sigma_mm = float(np.std(resid, ddof=2)) if len(resid) > 2 else np.nan
+
+        def _car(off_s: int, off_e: int, model: str) -> tuple[float, float]:
+            win = _get_win(r_i, off_s, off_e)
+            if win.empty:
+                return np.nan, np.nan
+            ars = []
+            for d, ri in win.items():
+                if model == "ma":
+                    ars.append(ri - mu_ma)
+                elif r_mkt is not None and d in r_mkt.index and not np.isnan(beta_mm):
+                    ars.append(ri - (alpha_mm + beta_mm * float(r_mkt.loc[d])))
+            if not ars:
+                return np.nan, np.nan
+            car = float(sum(ars))
+            sig = sigma_ma if model == "ma" else sigma_mm
+            t   = car / (sig * np.sqrt(len(ars))) if (sig and sig > 0) else np.nan
+            return car, t
+
+        # Single event-day return (day 0)
+        w0   = _get_win(r_i, 0, 0)
+        r_ev = float(w0.iloc[0]) if not w0.empty else np.nan
+        d0   = w0.index[0] if not w0.empty else None
+
+        ar_ma  = (r_ev - mu_ma)                                                      if not np.isnan(r_ev) else np.nan
+        z_ma   = (ar_ma / sigma_ma)                                                  if (sigma_ma and not np.isnan(ar_ma)) else np.nan
+        ar_mm  = r_ev - (alpha_mm + beta_mm * float(r_mkt.loc[d0]))                 if (d0 and r_mkt is not None and d0 in r_mkt.index and not np.isnan(beta_mm)) else np.nan
+        z_mm   = (ar_mm / sigma_mm)                                                  if (sigma_mm and not np.isnan(ar_mm)) else np.nan
+
+        car_11_ma, t_11_ma = _car(-1, 1, "ma")
+        car_33_ma, t_33_ma = _car(-3, 3, "ma")
+        car_11_mm, t_11_mm = _car(-1, 1, "mm")
+        car_33_mm, t_33_mm = _car(-3, 3, "mm")
+
+        # 30-day post-event (~21 trading days)
+        w30      = _get_win(r_i, 0, 20)
+        cr_30    = float(w30.sum())                                        if not w30.empty else np.nan
+        bhar_30  = float(np.prod(1 + w30.values) - 1)                     if not w30.empty else np.nan
+        bhar_abn = np.nan
+        if r_mkt is not None and not w30.empty:
+            rm30 = r_mkt.reindex(w30.index).dropna()
+            if len(rm30) > 0:
+                bhar_abn = bhar_30 - float(np.prod(1 + rm30.values) - 1)
+
+        rows.append({
+            "Ticker":        ticker,
+            # backward-compat single-day
+            "AR":            ar_ma,
+            "Z-Score":       z_ma,
+            "Return 24.02.": r_ev,
+            # single-day market model
+            "AR_mm":         ar_mm,
+            "Z_mm":          z_mm,
+            # CAR mean-adjusted
+            "CAR[-1,+1]":    car_11_ma,
+            "t[-1,+1]":      t_11_ma,
+            "CAR[-3,+3]":    car_33_ma,
+            "t[-3,+3]":      t_33_ma,
+            # CAR market model
+            "CAR[-1,+1]_mm": car_11_mm,
+            "t[-1,+1]_mm":   t_11_mm,
+            "CAR[-3,+3]_mm": car_33_mm,
+            "t[-3,+3]_mm":   t_33_mm,
+            # 30-day
+            "CR_30d":        cr_30,
+            "BHAR_30d":      bhar_abn,
+            # model params
+            "alpha":         alpha_mm,
+            "beta":          beta_mm,
+        })
+
     return pd.DataFrame(rows).set_index("Ticker") if rows else pd.DataFrame()
 
 
 def parse_russia_scores(text: str) -> dict:
-    """Extract scores from AI response — machine-readable block first, table as fallback."""
+    """Extract all structured fields from AI response."""
+    # Core scores from machine-readable block
     rev  = re.search(r'REVENUE_SCORE:\s*([0-3])', text)
     ops  = re.search(r'OPERATIONAL_SCORE:\s*([0-3])', text)
     conf = re.search(r'CONFIDENCE:\s*(High|Medium|Low)', text, re.IGNORECASE)
     tkr  = re.search(r'TICKER:\s*([A-Z0-9][A-Z0-9\.\-]{0,19})', text)
-    # Fallback: parse from markdown table / inline text
+    # Fallbacks from table
     if not rev:
-        rev  = re.search(r'Revenue Exposure Score[^\d]*([0-3])', text)
+        rev = re.search(r'Revenue Exposure Score[^\d]*([0-3])', text)
     if not ops:
-        ops  = re.search(r'Operational Exposure Score[^\d]*([0-3])', text)
+        ops = re.search(r'Operational Exposure Score[^\d]*([0-3])', text)
+
     _ticker = None
     if tkr:
         _t = tkr.group(1).strip()
         if _t.upper() != "UNKNOWN":
             _ticker = _t
+
+    # Extract narrative sections (between ### headings)
+    def _section(heading: str) -> str:
+        m = re.search(
+            r'###\s*' + re.escape(heading) + r'\s*\n(.*?)(?=\n###|\Z)',
+            text, re.DOTALL | re.IGNORECASE,
+        )
+        return m.group(1).strip() if m else ""
+
+    # Extract evidence from summary table rows
+    def _table_field(label: str) -> str:
+        m = re.search(r'\|\s*' + re.escape(label) + r'\s*\|\s*(.*?)\s*\|', text)
+        return m.group(1).strip() if m else ""
+
     return {
-        "revenue_score":      int(rev.group(1))           if rev  else None,
-        "operational_score":  int(ops.group(1))           if ops  else None,
-        "confidence":         conf.group(1).capitalize()  if conf else None,
-        "ticker":             _ticker,
+        "revenue_score":              int(rev.group(1))           if rev   else None,
+        "operational_score":          int(ops.group(1))           if ops   else None,
+        "confidence":                 conf.group(1).capitalize()  if conf  else None,
+        "ticker":                     _ticker,
+        "revenue_evidence":           _table_field("Revenue Exposure Evidence"),
+        "revenue_justification":      _section("Revenue Exposure Justification"),
+        "operational_evidence":       _table_field("Operational Exposure Evidence"),
+        "operational_justification":  _section("Operational Exposure Justification"),
+        "audit_trail":                _section("Audit Trail"),
+        "methodology_notes":          _section("Methodology Notes"),
     }
 
 
@@ -562,87 +685,122 @@ def parse_russia_scores(text: str) -> dict:
 # Russland-Analyse — Systemprompt & API-Wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 _RUSSIA_SYS = """\
-You are an academic research assistant supporting a bachelor thesis on the stock market effects of EU and US sanctions against Russia in 2022 on European large-cap firms in the STOXX Europe 600.
+You are an academic research assistant for a bachelor thesis:
+"How did 2022 EU/US sanctions against Russia affect stock market valuations of STOXX Europe 600 firms with different Russian exposure?"
 
-Your task is to assess each company's Russian market exposure before the Russian full-scale invasion on 24 February 2022.
+Assess each company's PRE-WAR Russian exposure (before 24 February 2022) using annual reports, investor presentations, regulatory filings, press releases, and reputable financial databases.
 
-For each company, collect and evaluate information on Russian exposure from reliable sources such as annual reports, company filings, investor presentations, official company statements, press releases, reputable financial databases, and credible news sources.
+======================================================================
+REVENUE EXPOSURE SCORE
+======================================================================
+Measure: Russian Revenue / Total Revenue
 
-Focus on two main exposure dimensions:
+  0 = No exposure or < 1% of total revenue
+  1 = Low:       ~1–5% of total revenue
+  2 = Moderate:  ~5–10% of total revenue
+  3 = High:      > 10% of total revenue
 
-1. Revenue Exposure
-Assess the extent to which the company generated sales or revenue in Russia before 24 February 2022.
+If exact figures are unavailable, estimate conservatively with qualitative evidence.
 
-Assign a Revenue Exposure Score:
-0 = No identifiable Russian revenue exposure or exposure below 1% of total revenue.
-1 = Low exposure: Russia-related revenue approximately 1–5% of total revenue.
-2 = Moderate exposure: Russia-related revenue approximately 5–10% of total revenue.
-3 = High exposure: Russia-related revenue above 10% of total revenue.
+Generate:
+  • Revenue Exposure Score (0/1/2/3)
+  • Revenue Exposure Evidence (key facts + sources, 1–3 sentences)
+  • Revenue Exposure Justification (50–150 words):
+      – why this score was assigned
+      – why a HIGHER score was NOT assigned
+      – why a LOWER score was NOT assigned
 
-If exact revenue shares are unavailable, estimate the score based on qualitative evidence, but clearly flag the estimate.
+======================================================================
+OPERATIONAL EXPOSURE SCORE
+======================================================================
+Evaluate these subdimensions:
+  1. Subsidiaries / legal entities in Russia
+  2. Production facilities
+  3. Employees in Russia
+  4. Retail presence / distribution networks
+  5. Joint ventures
+  6. Physical assets
+  7. Supply-chain dependence on Russia
+  8. Strategic importance of Russia for the business model
 
-2. Operational Exposure
-Assess the extent to which the company had operational, physical, or strategic business exposure to Russia before 24 February 2022.
+  0 = No operational presence
+  1 = Limited  (sales offices, small subs, minor distribution)
+  2 = Significant (multiple subs, relevant local ops, meaningful employees/assets)
+  3 = Critical  (major production, large workforce, strategic JVs, heavy supply-chain dependence)
 
-Include the following subdimensions when evaluating Operational Exposure:
-- Russian subsidiaries
-- production facilities
-- retail stores or distribution networks
-- local employees
-- joint ventures
-- physical assets
-- supply-chain dependence
-- strategic importance of Russia for the company's business model
+Do NOT create separate scores for Asset Exposure, Supply Chain, or Strategic Importance.
+Use them as subdimensions of the single Operational Exposure Score.
 
-Assign an Operational Exposure Score:
-0 = No identifiable operational presence in Russia.
-1 = Limited operational exposure, such as sales offices, small subsidiaries, minor distribution activities, or limited local staff.
-2 = Significant operational exposure, such as multiple subsidiaries, relevant local operations, meaningful employee presence, important distribution networks, or notable assets.
-3 = Critical operational exposure, such as major production facilities, substantial local assets, large-scale employee presence, strategically important joint ventures, or strong dependence on Russian supply chains or inputs.
+Generate:
+  • Operational Exposure Score (0/1/2/3)
+  • Operational Exposure Evidence (key facts + sources, 1–3 sentences)
+  • Operational Exposure Justification (50–150 words):
+      – which subdimensions contributed most
+      – why this score was assigned
+      – why a HIGHER score was NOT assigned
+      – why a LOWER score was NOT assigned
 
-Important: Do not create separate final scores for Asset Exposure, Supply Chain Exposure, or Strategic Importance. Instead, use these as subdimensions when assigning the Operational Exposure Score.
+======================================================================
+AUDIT TRAIL
+======================================================================
+For EACH score, list every source used. Format each entry exactly as:
 
-Rules:
-- Base the assessment on information available before or shortly after 24 February 2022.
-- Avoid using later divestment outcomes as direct evidence of pre-invasion exposure unless they reveal information about pre-existing Russian operations.
-- Clearly distinguish between factual evidence and inference.
-- If no reliable information is found, assign 0 only if there is evidence of no exposure. Otherwise write "Unknown" and explain why.
-- Do not overstate exposure based on vague mentions of Eastern Europe, CIS, or emerging markets unless Russia is specifically identified.
-- Prefer conservative scoring when evidence is ambiguous.
-- Include short justifications for every score.
-- Use consistent scoring across all firms.
+**Source:** [document name, year, page/URL if known]
+**Evidence:** "[exact quote or precise paraphrase]"
+**Interpretation:** [how this evidence influenced the score]
+**Score Impact:** Revenue Score = X | Operational Score = X
 
-Output Format:
-Produce the assessment as a Markdown table with the following columns, then add an explanation section below the table.
+======================================================================
+QUALITY RULES
+======================================================================
+• Use ONLY information available before or immediately after 24 February 2022
+• Conservative scoring when evidence is ambiguous
+• Mark all inferences as [ESTIMATE] or [INFERRED]
+• Never assign scores without justification
+• Do NOT use post-war divestment as primary evidence of pre-war exposure
+• Do NOT conflate Eastern Europe / CIS / "international" with Russia unless
+  Russia is explicitly identified
 
+======================================================================
+OUTPUT FORMAT (use this structure exactly)
+======================================================================
+
+## [Company Name]
+
+### Summary Table
 | Field | Content |
 |---|---|
-| Company Name | Full legal name |
-| Ticker | Stock ticker (e.g. SIE.DE) |
-| Country | Country of headquarters |
-| Sector | GICS sector |
+| Company Name | ... |
+| Ticker | [yfinance ticker, e.g. RNO.PA, VOW3.DE, BP.L, NESN.SW] |
+| Country | ... |
+| Sector (GICS) | ... |
 | Revenue Exposure Score | 0 / 1 / 2 / 3 |
-| Revenue Exposure Evidence | Short justification with source citation |
+| Revenue Exposure Evidence | ... |
 | Operational Exposure Score | 0 / 1 / 2 / 3 |
-| Operational Exposure Evidence | Short justification with source citation |
+| Operational Exposure Evidence | ... |
 | Confidence Level | High / Medium / Low |
-| Sources | List of sources used |
-| Notes | Flags, caveats, or inferences clearly marked as [ESTIMATE] or [INFERRED] |
+| Sources | ... |
+| Notes | ... |
 
-After the table, add a brief paragraph explaining how the scores were assigned and any limitations in the data.
+### Revenue Exposure Justification
+[50–150 words]
 
-Confidence Level definitions:
-- High = based on quantitative disclosures or multiple reliable sources.
-- Medium = based on credible qualitative evidence but limited quantitative detail.
-- Low = based on indirect evidence, estimates, or incomplete information.
+### Operational Exposure Justification
+[50–150 words]
 
-IMPORTANT: At the very end of your response, always append this exact block (required for automated processing — never skip or modify the format):
+### Audit Trail
+[structured audit entries as described above]
+
+### Methodology Notes
+[caveats, data limitations, inference flags]
+
+IMPORTANT — append this block verbatim at the very end (required for automated processing — never skip or modify the format):
 
 ```scores
 REVENUE_SCORE: [0|1|2|3]
 OPERATIONAL_SCORE: [0|1|2|3]
 CONFIDENCE: [High|Medium|Low]
-TICKER: [correct yfinance ticker for the primary stock exchange listing, e.g. RNO.PA, VOW3.DE, BP.L, NESN.SW, ENI.MI — if genuinely unknown write UNKNOWN]
+TICKER: [yfinance ticker for primary listing — if genuinely unknown write UNKNOWN]
 ```\
 """
 
@@ -1341,38 +1499,35 @@ with tab_russia:
                     st.error(f"API-Fehler: {_exc}")
 
             if _has_result:
-                _result      = st.session_state["russia_cache"][_cache_key]
-                _parsed      = parse_russia_scores(_result)
-                _rev_sc      = _parsed.get("revenue_score")
-                _ops_sc      = _parsed.get("operational_score")
-                _conf        = _parsed.get("confidence") or ""
-                _ai_ticker   = _parsed.get("ticker") or ""
-                _eff_ticker  = _ai_ticker or (
+                _result     = st.session_state["russia_cache"][_cache_key]
+                _parsed     = parse_russia_scores(_result)
+                _rev_sc     = _parsed.get("revenue_score")
+                _ops_sc     = _parsed.get("operational_score")
+                _conf       = _parsed.get("confidence") or ""
+                _ai_ticker  = _parsed.get("ticker") or ""
+                _eff_ticker = _ai_ticker or (
                     _company_name if _inp_mode != "Firmenname eingeben" else ""
                 )
 
-                # ── AR berechnen ─────────────────────────────────────────
-                _ar_val = _z_val = None
+                # ── Event-Study-Metriken ──────────────────────────────────
+                _ar_row: dict = {}
                 if _eff_ticker:
-                    with st.spinner("Berechne Abnormale Rendite …"):
+                    with st.spinner("Berechne CAR/BHAR …"):
                         _ar_df = calc_ar_thesis((_eff_ticker.strip(),))
                     if not _ar_df.empty and _eff_ticker.strip() in _ar_df.index:
-                        _ar_val = float(_ar_df.loc[_eff_ticker.strip(), "AR"])
-                        _z_val  = float(_ar_df.loc[_eff_ticker.strip(), "Z-Score"])
+                        _ar_row = _ar_df.loc[_eff_ticker.strip()].to_dict()
 
-                # ── Ergebnis-Karte ────────────────────────────────────────
+                # ── KPI-Karten ────────────────────────────────────────────
                 _SC_COLOR = {0: "#9CA3AF", 1: "#3B82F6", 2: "#F59E0B", 3: "#DC2626"}
-                _SC_DESC  = {0: "Keine  <1 %", 1: "Gering  1–5 %",
-                             2: "Moderat  5–10 %", 3: "Hoch  >10 %"}
-                _OP_DESC  = {0: "Keine", 1: "Begrenzt",
-                             2: "Signifikant", 3: "Kritisch"}
+                _SC_DESC  = {0: "< 1 %", 1: "1–5 %", 2: "5–10 %", 3: "> 10 %"}
+                _OP_DESC  = {0: "Keine", 1: "Begrenzt", 2: "Signifikant", 3: "Kritisch"}
 
                 def _kpi(label, val, sub, color):
                     return (
                         f"<div style='text-align:center;padding:0.6rem 0.25rem'>"
                         f"<div style='font-size:0.6rem;font-weight:700;color:#9CA3AF;"
-                        f"text-transform:uppercase;letter-spacing:0.07em;"
-                        f"margin-bottom:5px'>{label}</div>"
+                        f"text-transform:uppercase;letter-spacing:0.07em;margin-bottom:5px'>"
+                        f"{label}</div>"
                         f"<div style='font-size:1.8rem;font-weight:800;color:{color};"
                         f"line-height:1;letter-spacing:-0.02em'>{val}</div>"
                         f"<div style='font-size:0.7rem;color:#6B7280;margin-top:4px'>{sub}</div>"
@@ -1385,13 +1540,27 @@ with tab_russia:
                                    _SC_DESC.get(_rev_sc, ""), _SC_COLOR.get(_rev_sc, "#9CA3AF"))
                     _cells += _kpi("Op. Score", f"{(_ops_sc or 0)}/3",
                                    _OP_DESC.get(_ops_sc or 0, ""), _SC_COLOR.get(_ops_sc or 0, "#9CA3AF"))
-                if _ar_val is not None:
-                    _ar_clr  = "#16A34A" if _ar_val >= 0 else "#DC2626"
-                    _z_sig   = ("Extrem" if abs(_z_val) > 3
-                                else "Signifikant" if abs(_z_val) > 2 else "Normal")
-                    _cells  += _kpi("AR  24.02.2022", f"{_ar_val*100:+.1f}%",
-                                    _eff_ticker, _ar_clr)
-                    _cells  += _kpi("Z-Score", f"{_z_val:.2f}", _z_sig, _ar_clr)
+
+                _car11 = _ar_row.get("CAR[-1,+1]")
+                _car33 = _ar_row.get("CAR[-3,+3]")
+                _car11_mm = _ar_row.get("CAR[-1,+1]_mm")
+                _t11   = _ar_row.get("t[-1,+1]")
+                _bhar  = _ar_row.get("BHAR_30d")
+
+                if _car11 is not None and not np.isnan(_car11):
+                    _clr11 = "#16A34A" if _car11 >= 0 else "#DC2626"
+                    _sig   = ("Extrem" if abs(_t11) > 3 else "Sign." if abs(_t11) > 2 else "Normal") if (_t11 and not np.isnan(_t11)) else "—"
+                    _cells += _kpi("CAR[−1,+1]", f"{_car11*100:+.2f}%", f"Mean-Adj · t={_t11:.2f}" if (_t11 and not np.isnan(_t11)) else "Mean-Adj", _clr11)
+                if _car33 is not None and not np.isnan(_car33):
+                    _clr33 = "#16A34A" if _car33 >= 0 else "#DC2626"
+                    _cells += _kpi("CAR[−3,+3]", f"{_car33*100:+.2f}%", "Mean-Adj", _clr33)
+                if _car11_mm is not None and not np.isnan(_car11_mm):
+                    _clr_mm = "#16A34A" if _car11_mm >= 0 else "#DC2626"
+                    _t11mm = _ar_row.get("t[-1,+1]_mm")
+                    _cells += _kpi("CAR[−1,+1]", f"{_car11_mm*100:+.2f}%", f"Mkt-Model · t={_t11mm:.2f}" if (_t11mm and not np.isnan(_t11mm)) else "Mkt-Model", _clr_mm)
+                if _bhar is not None and not np.isnan(_bhar):
+                    _bclr = "#16A34A" if _bhar >= 0 else "#DC2626"
+                    _cells += _kpi("BHAR 30d", f"{_bhar*100:+.2f}%", _eff_ticker, _bclr)
                 if _conf:
                     _cells += _kpi("Confidence", _conf, "", "#6B7280")
 
@@ -1399,52 +1568,65 @@ with tab_russia:
                     st.markdown(
                         f"<div style='background:#F8FAFC;border:1px solid #E2E8F0;"
                         f"border-radius:12px;padding:0.75rem 1rem;margin:0.75rem 0;"
-                        f"display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr))'>"
+                        f"display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr))'>"
                         f"{_cells}</div>",
                         unsafe_allow_html=True,
                     )
 
+                # ── Justifications & Audit Trail ──────────────────────────
+                _rev_just = _parsed.get("revenue_justification", "")
+                _ops_just = _parsed.get("operational_justification", "")
+                _audit    = _parsed.get("audit_trail", "")
+                _meth     = _parsed.get("methodology_notes", "")
+                if _rev_just or _ops_just:
+                    with st.expander("Justifications (Revenue & Operational)", expanded=False):
+                        if _rev_just:
+                            st.markdown("**Revenue Exposure Justification**")
+                            st.markdown(_rev_just)
+                        if _ops_just:
+                            st.markdown("**Operational Exposure Justification**")
+                            st.markdown(_ops_just)
+                if _audit:
+                    with st.expander("Audit Trail", expanded=False):
+                        st.markdown(_audit)
+                if _meth:
+                    with st.expander("Methodology Notes", expanded=False):
+                        st.markdown(_meth)
+
                 # ── Zur Thesis hinzufügen ─────────────────────────────────
                 if _rev_sc is not None:
-                    _thesis_label = (
-                        f"Zur Thesis-Analyse hinzufügen"
-                        + (" · bereits vorhanden" if (
-                            _eff_ticker and _eff_ticker in
-                            load_scores()["Ticker"].values
-                        ) else "")
-                    )
+                    _already = (_eff_ticker and _eff_ticker in load_scores()["Ticker"].values)
+                    _thesis_label = "Zur Thesis-Analyse hinzufügen" + (" · bereits vorhanden" if _already else "")
                     if st.button(_thesis_label, type="primary",
                                  use_container_width=False, key="add_thesis"):
                         _df_ex = load_scores()
-                        _tk    = _eff_ticker or _company_name
-                        _new   = {
-                            "Ticker":            _tk,
-                            "Unternehmen":       _company_name
-                                                 if _inp_mode == "Firmenname eingeben"
-                                                 else "",
-                            "Sektor":            "",
-                            "Revenue Score":     _rev_sc,
-                            "Operational Score": _ops_sc or 0,
-                            "Confidence":        _conf,
-                            "Notizen":           "",
+                        _tk = _eff_ticker or _company_name
+                        _new = {
+                            "Ticker":                    _tk,
+                            "Unternehmen":               _company_name if _inp_mode == "Firmenname eingeben" else "",
+                            "Sektor":                    "",
+                            "Revenue Score":             _rev_sc,
+                            "Revenue Evidence":          _parsed.get("revenue_evidence", ""),
+                            "Revenue Justification":     _parsed.get("revenue_justification", ""),
+                            "Operational Score":         _ops_sc or 0,
+                            "Operational Evidence":      _parsed.get("operational_evidence", ""),
+                            "Operational Justification": _parsed.get("operational_justification", ""),
+                            "Confidence":                _conf,
+                            "Audit Trail":               _parsed.get("audit_trail", ""),
+                            "Notizen":                   "",
                         }
                         _mask = _df_ex["Ticker"] == _tk
                         if _mask.any():
                             for _k, _v in _new.items():
                                 _df_ex.loc[_mask, _k] = _v
                         else:
-                            _df_ex = pd.concat(
-                                [_df_ex, pd.DataFrame([_new])], ignore_index=True
-                            )
+                            _df_ex = pd.concat([_df_ex, pd.DataFrame([_new])], ignore_index=True)
                         save_scores(_df_ex)
-                        st.toast(f"{_tk} gespeichert — jetzt im Thesis-Analyse Tab.", icon="✅")
+                        st.toast(f"{_tk} gespeichert.", icon="✅")
 
                 # ── Vollständige Analyse ──────────────────────────────────
                 divider(f"Vollständige Analyse: {_company_name}")
-                # Hide the machine-readable scores block from display
-                _display_result = re.sub(
-                    r'```scores\n.*?```', '', _result, flags=re.DOTALL
-                ).strip()
+                _display_result = re.sub(r'```scores\n.*?```', '', _result, flags=re.DOTALL).strip()
                 st.markdown(_display_result)
                 divider()
                 _dl_col, _ = st.columns([2, 3])
@@ -1452,10 +1634,7 @@ with tab_russia:
                     st.download_button(
                         label="Analyse herunterladen (.md)",
                         data=_result.encode("utf-8"),
-                        file_name=(
-                            f"russland_analyse_"
-                            f"{_company_name.replace(' ', '_').replace('/', '_')}.md"
-                        ),
+                        file_name=f"russland_analyse_{_company_name.replace(' ', '_').replace('/', '_')}.md",
                         mime="text/markdown",
                         use_container_width=True,
                     )
@@ -1468,7 +1647,7 @@ with tab_russia:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 4 — THESIS-ANALYSE  (Russia Exposure × Abnormale Renditen)
+# TAB 4 — THESIS-ANALYSE  (Russia Exposure × CAR)
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_thesis:
 
@@ -1476,11 +1655,11 @@ with tab_thesis:
         "<div style='background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;"
         "padding:0.85rem 1.1rem;margin-bottom:1.25rem'>"
         "<div style='font-size:0.84rem;font-weight:600;color:#1E40AF'>"
-        "Thesis-Analyse — Russia Exposure × Abnormale Renditen</div>"
+        "Thesis-Analyse — Russia Exposure × Kumulierte Abnormale Renditen</div>"
         "<div style='font-size:0.78rem;color:#1D4ED8;margin-top:3px;line-height:1.5'>"
-        "Trage die Exposure-Scores aus der Russland-Analyse ein, dann berechne die "
-        "Abnormalen Renditen vom 24.02.2022. Das Ergebnis ist die Datenbasis für "
-        "deine Regressionsanalyse."
+        "Exposure-Scores aus der Russland-Analyse werden mit CAR[-1,+1], CAR[-3,+3] "
+        "und BHAR(30d) verknüpft. Beide Modelle (Mean-Adjusted + Market Model) werden "
+        "parallel berechnet."
         "</div></div>",
         unsafe_allow_html=True,
     )
@@ -1488,20 +1667,20 @@ with tab_thesis:
     # ── Score-Tabelle ─────────────────────────────────────────────────────────
     divider("Exposure-Scores")
     st.caption(
-        "Ticker-Format: SAP.DE · NESN.SW · BP.L · ENI.MI usw. — "
-        "Revenue/Operational Score je 0–3 gemäß Thesis-Methodologie."
+        "Ticker-Format: SAP.DE · NESN.SW · BP.L · ENI.MI — "
+        "Rev/Op Score je 0–3. Scores aus der Russland-Analyse werden automatisch befüllt."
     )
 
     _df_sc = load_scores()
+    _display_cols = ["Ticker", "Unternehmen", "Sektor",
+                     "Revenue Score", "Operational Score", "Confidence", "Notizen"]
     _edited = st.data_editor(
-        _df_sc,
+        _df_sc[_display_cols] if all(c in _df_sc.columns for c in _display_cols) else _df_sc,
         column_config={
-            "Ticker": st.column_config.TextColumn(
-                "Ticker", width="small", help="yfinance-Ticker, z.B. SAP.DE"
-            ),
-            "Unternehmen": st.column_config.TextColumn("Unternehmen", width="medium"),
-            "Sektor": st.column_config.TextColumn("Sektor (GICS)", width="medium"),
-            "Revenue Score": st.column_config.SelectboxColumn(
+            "Ticker":            st.column_config.TextColumn("Ticker", width="small"),
+            "Unternehmen":       st.column_config.TextColumn("Unternehmen", width="medium"),
+            "Sektor":            st.column_config.TextColumn("Sektor (GICS)", width="medium"),
+            "Revenue Score":     st.column_config.SelectboxColumn(
                 "Rev. Score", options=[0, 1, 2, 3], width="small",
                 help="0 = <1 % · 1 = 1–5 % · 2 = 5–10 % · 3 = >10 % Russland-Umsatz",
             ),
@@ -1509,28 +1688,37 @@ with tab_thesis:
                 "Op. Score", options=[0, 1, 2, 3], width="small",
                 help="0 = keine · 1 = begrenzt · 2 = signifikant · 3 = kritisch",
             ),
-            "Confidence": st.column_config.SelectboxColumn(
+            "Confidence":        st.column_config.SelectboxColumn(
                 "Confidence", options=["High", "Medium", "Low"], width="small",
             ),
-            "Notizen": st.column_config.TextColumn("Notizen / Flags", width="large"),
+            "Notizen":           st.column_config.TextColumn("Notizen / Flags", width="large"),
         },
         num_rows="dynamic",
         use_container_width=True,
         key="scores_editor",
-        height=min(380, 80 + len(_df_sc) * 36),
+        height=min(400, 80 + len(_df_sc) * 36),
     )
 
     _sc1, _sc2, _sc3 = st.columns([1, 1, 4])
     with _sc1:
         if st.button("Speichern", type="primary", use_container_width=True, key="save_scores"):
-            save_scores(_edited)
+            # Merge edited display cols back into full score df
+            _full = load_scores()
+            for _c in _display_cols:
+                if _c in _edited.columns:
+                    if len(_edited) == len(_full):
+                        _full[_c] = _edited[_c].values
+                    else:
+                        _full = _edited.copy()
+                        break
+            save_scores(_full if len(_edited) == len(_full) else _edited)
             st.toast("Scores gespeichert.", icon="✅")
     with _sc2:
         if st.button("Cache leeren", use_container_width=True, key="clear_thesis_cache"):
             calc_ar_thesis.clear()
             st.toast("Cache geleert.")
 
-    # ── AR berechnen ──────────────────────────────────────────────────────────
+    # ── Modell-Auswahl ────────────────────────────────────────────────────────
     _valid = _edited.dropna(subset=["Ticker"]).copy()
     _valid = _valid[_valid["Ticker"].str.strip().ne("")]
 
@@ -1538,22 +1726,47 @@ with tab_thesis:
         st.info("Mindestens 2 Unternehmen mit Ticker und Scores eintragen.")
         st.stop()
 
-    divider("Abnormale Renditen")
+    divider("Modell & Event-Fenster")
+    _msel_col, _wsel_col, _ = st.columns([2, 2, 3])
+    with _msel_col:
+        _model_choice = st.radio(
+            "Modell",
+            ["Mean-Adjusted", "Market Model (OLS)"],
+            horizontal=True,
+            label_visibility="visible",
+            key="thesis_model",
+        )
+    with _wsel_col:
+        _window_choice = st.radio(
+            "Event-Fenster",
+            ["CAR[−1,+1]", "CAR[−3,+3]"],
+            horizontal=True,
+            label_visibility="visible",
+            key="thesis_window",
+        )
+
+    _is_mm     = ("Market" in _model_choice)
+    _win_sfx   = "_mm" if _is_mm else ""
+    _car_col   = ("CAR[-1,+1]" if "1" in _window_choice else "CAR[-3,+3]") + _win_sfx
+    _t_col     = ("t[-1,+1]"   if "1" in _window_choice else "t[-3,+3]")   + _win_sfx
+    _car_label = f"{'CAR[−1,+1]' if '1' in _window_choice else 'CAR[−3,+3]'} ({'Mkt-Model' if _is_mm else 'Mean-Adj'})"
+
     st.markdown(
         f"<p style='font-size:0.875rem;color:#6B7280'>"
-        f"<b>{len(_valid)}</b> Unternehmen · "
-        f"Schätzfenster: 60 Handelstage vor 24.02.2022 · "
-        f"AR = Return(24.02.) − Ø(Schätzfenster)</p>",
+        f"<b>{len(_valid)}</b> Unternehmen · Benchmark: {_BENCHMARK_TICKER} · "
+        f"Schätzfenster: 120 Handelstage, endet 11 Tage vor Event · "
+        f"Primärmetrik: <b>{_car_label}</b></p>",
         unsafe_allow_html=True,
     )
 
-    if st.button("Abnormale Renditen berechnen", type="primary", key="calc_ar_btn"):
+    if st.button("CAR / BHAR berechnen", type="primary", key="calc_ar_btn"):
+        calc_ar_thesis.clear()
         st.session_state["thesis_ar_ready"] = True
 
     if not st.session_state.get("thesis_ar_ready"):
         st.stop()
 
-    with st.spinner("Lade Preisdaten …"):
+    with st.spinner("Lade Preisdaten & berechne CAR …"):
         _tickers_t = tuple(_valid["Ticker"].str.strip().tolist())
         _df_ar = calc_ar_thesis(_tickers_t)
 
@@ -1562,42 +1775,50 @@ with tab_thesis:
         st.stop()
 
     # ── Merge ─────────────────────────────────────────────────────────────────
-    _valid = _valid.set_index("Ticker")
-    _valid.index = _valid.index.str.strip()
-    _df_merged = _valid.join(_df_ar, how="left")
+    _valid2 = _valid.set_index("Ticker").copy()
+    _valid2.index = _valid2.index.str.strip()
+    _df_merged = _valid2.join(_df_ar, how="left")
     _df_merged["Combined Score"] = (
         _df_merged["Revenue Score"].fillna(0).astype(int)
         + _df_merged["Operational Score"].fillna(0).astype(int)
     )
-    _df_plot = _df_merged.dropna(subset=["AR"])
-    _n_ok   = len(_df_plot)
-    _n_miss = len(_df_merged) - _n_ok
+
+    _df_plot = _df_merged.dropna(subset=[_car_col]) if _car_col in _df_merged.columns else pd.DataFrame()
+    _n_ok    = len(_df_plot)
+    _n_miss  = len(_df_merged) - _n_ok
     st.caption(
-        f"{_n_ok} von {len(_df_merged)} Aktien mit AR · "
+        f"{_n_ok} von {len(_df_merged)} Aktien mit {_car_label} · "
         + (f"{_n_miss} ohne Preisdaten (Ticker prüfen)" if _n_miss else "alle geladen ✓")
     )
+
+    if _df_plot.empty:
+        st.warning("Keine verwertbaren Daten. Bitte erst 'CAR / BHAR berechnen' klicken.")
+        st.stop()
 
     # ── Scatter helper ────────────────────────────────────────────────────────
     _SCORE_COLORS = {0: "#9CA3AF", 1: "#2563EB", 2: "#F59E0B", 3: "#DC2626"}
     _SCORE_LABELS = {0: "0 – Keine", 1: "1 – Gering", 2: "2 – Signifikant", 3: "3 – Kritisch"}
 
-    def _make_scatter(df: pd.DataFrame, score_col: str, title: str) -> go.Figure:
+    def _make_scatter(df: pd.DataFrame, score_col: str, y_col: str, y_label: str, title: str) -> go.Figure:
+        _df_s = df.dropna(subset=[score_col, y_col])
+        if _df_s.empty:
+            return go.Figure()
         rng    = np.random.default_rng(42)
-        jitter = rng.uniform(-0.12, 0.12, len(df))
-        x_j    = df[score_col].astype(float) + jitter
-        y_pct  = df["AR"] * 100
+        jitter = rng.uniform(-0.12, 0.12, len(_df_s))
+        x_j    = _df_s[score_col].astype(float) + jitter
+        y_pct  = _df_s[y_col] * 100
+        pt_colors = [_SCORE_COLORS.get(int(s), "#9CA3AF") for s in _df_s[score_col].fillna(0).astype(int)]
 
-        pt_colors = [_SCORE_COLORS.get(int(s), "#9CA3AF")
-                     for s in df[score_col].fillna(0).astype(int)]
-        hover = [
-            f"<b>{idx}</b><br>"
-            f"{row.get('Unternehmen', '')}<br>"
-            f"{score_col}: {int(row[score_col]) if pd.notna(row[score_col]) else '?'}<br>"
-            f"AR: {row['AR']*100:+.2f}%<br>"
-            f"Z: {row['Z-Score']:.2f}" if pd.notna(row.get("Z-Score")) else
-            f"<b>{idx}</b><br>AR: {row['AR']*100:+.2f}%"
-            for idx, row in df.iterrows()
-        ]
+        _t_c = _t_col if y_col == _car_col else None
+        hover = []
+        for idx, row in _df_s.iterrows():
+            _t_val = f"  t={row[_t_c]:.2f}" if (_t_c and _t_c in row and pd.notna(row[_t_c])) else ""
+            hover.append(
+                f"<b>{idx}</b><br>"
+                f"{row.get('Unternehmen', '')}<br>"
+                f"{score_col}: {int(row[score_col]) if pd.notna(row[score_col]) else '?'}<br>"
+                f"{y_label}: {row[y_col]*100:+.2f}%{_t_val}"
+            )
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(
@@ -1606,31 +1827,30 @@ with tab_thesis:
                         line=dict(color="white", width=1.5)),
             text=hover, hoverinfo="text", showlegend=False,
         ))
-        if len(df) <= 30:
+        if len(_df_s) <= 40:
             fig.add_trace(go.Scatter(
                 x=x_j, y=y_pct, mode="text",
-                text=df.index.tolist(),
+                text=_df_s.index.tolist(),
                 textposition="top center",
                 textfont=dict(size=8, color="#6B7280"),
                 hoverinfo="skip", showlegend=False,
             ))
 
-        # OLS trend line + R²
-        _xv = df[score_col].astype(float).values
+        _xv = _df_s[score_col].astype(float).values
         _yv = y_pct.values
         _m  = ~(np.isnan(_xv) | np.isnan(_yv))
         if _m.sum() >= 4 and len(np.unique(_xv[_m])) >= 2:
-            coeffs  = np.polyfit(_xv[_m], _yv[_m], 1)
-            _xr     = np.linspace(_xv[_m].min(), _xv[_m].max(), 60)
-            _yr     = np.polyval(coeffs, _xr)
-            ss_res  = np.sum((_yv[_m] - np.polyval(coeffs, _xv[_m])) ** 2)
-            ss_tot  = np.sum((_yv[_m] - _yv[_m].mean()) ** 2)
-            r2      = 1 - ss_res / ss_tot if ss_tot > 0 else 0
-            slope   = coeffs[0]
+            coeffs = np.polyfit(_xv[_m], _yv[_m], 1)
+            _xr    = np.linspace(_xv[_m].min(), _xv[_m].max(), 60)
+            _yr    = np.polyval(coeffs, _xr)
+            ss_res = np.sum((_yv[_m] - np.polyval(coeffs, _xv[_m])) ** 2)
+            ss_tot = np.sum((_yv[_m] - _yv[_m].mean()) ** 2)
+            r2     = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+            corr   = np.corrcoef(_xv[_m], _yv[_m])[0, 1]
             fig.add_trace(go.Scatter(
                 x=_xr, y=_yr, mode="lines",
                 line=dict(color="#94A3B8", dash="dash", width=1.5),
-                name=f"OLS  R²={r2:.3f}  β={slope:+.2f}",
+                name=f"OLS  r={corr:+.3f}  R²={r2:.3f}  β={coeffs[0]:+.2f}  n={_m.sum()}",
                 showlegend=True,
             ))
 
@@ -1642,11 +1862,10 @@ with tab_thesis:
                 title="Exposure Score", tickvals=[0, 1, 2, 3],
                 ticktext=[_SCORE_LABELS[i] for i in range(4)],
                 gridcolor="#F3F4F6", zeroline=False,
-                tickfont=dict(size=10, color="#6B7280"),
-                range=[-0.5, 3.5],
+                tickfont=dict(size=10, color="#6B7280"), range=[-0.5, 3.5],
             ),
             yaxis=dict(
-                title="Abnormale Rendite (%)", tickformat=".1f",
+                title=f"{y_label} (%)", tickformat=".1f",
                 gridcolor="#F3F4F6", zeroline=False,
                 tickfont=dict(size=11, color="#6B7280"),
             ),
@@ -1656,11 +1875,12 @@ with tab_thesis:
         )
         return fig
 
-    # ── Gruppen-Balken helper ─────────────────────────────────────────────────
-    def _make_group_bar(df: pd.DataFrame, score_col: str, title: str) -> go.Figure:
-        grp = (df.groupby(score_col)["AR"]
-                 .agg(["mean", "sem", "count"])
-                 .reset_index())
+    def _make_group_bar(df: pd.DataFrame, score_col: str, y_col: str, y_label: str, title: str) -> go.Figure:
+        _df_g = df.dropna(subset=[score_col, y_col])
+        if _df_g.empty:
+            return go.Figure()
+        grp = (_df_g.groupby(score_col)[y_col]
+                .agg(["mean", "sem", "count"]).reset_index())
         grp["mean_pct"] = grp["mean"] * 100
         grp["err_pct"]  = grp["sem"]  * 100 * 1.96
         bar_colors = [_SCORE_COLORS.get(int(s), "#9CA3AF") for s in grp[score_col]]
@@ -1670,83 +1890,132 @@ with tab_thesis:
             error_y=dict(type="data", array=grp["err_pct"].tolist(),
                          color="#9CA3AF", thickness=1.5, width=6),
             marker_color=bar_colors,
-            text=[f"{v:+.2f}%<br>(n={n})" for v, n in zip(grp["mean_pct"], grp["count"])],
+            text=[f"{v:+.2f}%\n(n={n})" for v, n in zip(grp["mean_pct"], grp["count"])],
             textposition="outside",
-            hovertemplate="%{x}<br>Ø AR: %{y:.3f}%<extra></extra>",
+            hovertemplate=f"%{{x}}<br>Ø {y_label}: %{{y:.3f}}%<extra></extra>",
         ))
         fig.add_hline(y=0, line_color="#E5E7EB", line_width=1)
         fig.update_layout(
             height=340, margin=dict(l=0, r=0, t=36, b=0),
             title=dict(text=title, font=dict(size=13, color="#374151")),
             yaxis=dict(tickformat=".1f", gridcolor="#F3F4F6", zeroline=False,
-                       title="Ø Abnormale Rendite (%)", tickfont=dict(size=11, color="#6B7280")),
+                       title=f"Ø {y_label} (%)", tickfont=dict(size=11, color="#6B7280")),
             xaxis=dict(tickfont=dict(size=10, color="#374151")),
             plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF", showlegend=False,
         )
         return fig
 
-    # ── Plots ─────────────────────────────────────────────────────────────────
-    divider("Revenue Exposure vs. AR")
+    # ── Scatter-Plots: primäres CAR-Fenster ───────────────────────────────────
+    divider(f"Scatter: Exposure vs. {_car_label}")
     _pc1, _pc2 = st.columns(2)
     with _pc1:
         st.plotly_chart(
-            _make_scatter(_df_plot, "Revenue Score",
-                          "Revenue Score vs. Abnormale Rendite (24.02.2022)"),
+            _make_scatter(_df_plot, "Revenue Score", _car_col, _car_label,
+                          f"Revenue Score vs. {_car_label}"),
             use_container_width=True,
         )
     with _pc2:
         st.plotly_chart(
-            _make_scatter(_df_plot, "Operational Score",
-                          "Operational Score vs. Abnormale Rendite (24.02.2022)"),
+            _make_scatter(_df_plot, "Operational Score", _car_col, _car_label,
+                          f"Operational Score vs. {_car_label}"),
             use_container_width=True,
         )
 
-    divider("Durchschnittliche AR nach Score-Gruppe")
+    # ── Robustness: anderes CAR-Fenster ──────────────────────────────────────
+    _rob_win    = "CAR[-3,+3]" if "1" in _window_choice else "CAR[-1,+1]"
+    _rob_col    = _rob_win + _win_sfx
+    _rob_label  = f"{'CAR[−3,+3]' if '1' in _window_choice else 'CAR[−1,+1]'} ({'Mkt-Model' if _is_mm else 'Mean-Adj'}) — Robustness"
+    _df_rob     = _df_merged.dropna(subset=[_rob_col]) if _rob_col in _df_merged.columns else pd.DataFrame()
+    if not _df_rob.empty:
+        divider(f"Robustness: {_rob_label}")
+        _rc1, _rc2 = st.columns(2)
+        with _rc1:
+            st.plotly_chart(
+                _make_scatter(_df_rob, "Revenue Score", _rob_col, _rob_label,
+                              f"Revenue Score vs. {_rob_label}"),
+                use_container_width=True,
+            )
+        with _rc2:
+            st.plotly_chart(
+                _make_scatter(_df_rob, "Operational Score", _rob_col, _rob_label,
+                              f"Operational Score vs. {_rob_label}"),
+                use_container_width=True,
+            )
+
+    # ── 30-Tage-BHAR ─────────────────────────────────────────────────────────
+    _bhar_col   = "BHAR_30d"
+    _df_bhar    = _df_merged.dropna(subset=[_bhar_col]) if _bhar_col in _df_merged.columns else pd.DataFrame()
+    if not _df_bhar.empty:
+        divider("30-Tage BHAR nach Score-Gruppe")
+        _bc1, _bc2 = st.columns(2)
+        with _bc1:
+            st.plotly_chart(
+                _make_group_bar(_df_bhar, "Revenue Score", _bhar_col,
+                                "BHAR 30d", "Ø BHAR(30d) nach Revenue Score"),
+                use_container_width=True,
+            )
+        with _bc2:
+            st.plotly_chart(
+                _make_group_bar(_df_bhar, "Operational Score", _bhar_col,
+                                "BHAR 30d", "Ø BHAR(30d) nach Operational Score"),
+                use_container_width=True,
+            )
+
+    # ── Gruppen-Balken: primäres CAR ──────────────────────────────────────────
+    divider(f"Ø {_car_label} nach Score-Gruppe")
     _gc1, _gc2 = st.columns(2)
     with _gc1:
         st.plotly_chart(
-            _make_group_bar(_df_plot, "Revenue Score", "Ø AR nach Revenue Score"),
+            _make_group_bar(_df_plot, "Revenue Score", _car_col, _car_label,
+                            f"Ø {_car_label} nach Revenue Score"),
             use_container_width=True,
         )
     with _gc2:
         st.plotly_chart(
-            _make_group_bar(_df_plot, "Operational Score", "Ø AR nach Operational Score"),
+            _make_group_bar(_df_plot, "Operational Score", _car_col, _car_label,
+                            f"Ø {_car_label} nach Operational Score"),
             use_container_width=True,
         )
 
-    # ── Statistik-Tabelle ─────────────────────────────────────────────────────
+    # ── Deskriptive Statistik ─────────────────────────────────────────────────
     divider("Deskriptive Statistik nach Gruppe")
     _stat_rows = []
     for _sc_col in ["Revenue Score", "Operational Score"]:
         for _sc_val, _grp in _df_plot.groupby(_sc_col):
-            _stat_rows.append({
-                "Dimension":   _sc_col,
-                "Score":       int(_sc_val),
-                "n":           len(_grp),
-                "Ø AR":        _grp["AR"].mean(),
-                "Median AR":   _grp["AR"].median(),
-                "Std AR":      _grp["AR"].std(),
-                "Min AR":      _grp["AR"].min(),
-                "Max AR":      _grp["AR"].max(),
-            })
+            _row = {
+                "Dimension": _sc_col, "Score": int(_sc_val), "n": len(_grp),
+            }
+            for _mc, _ml in [(_car_col, _car_label), (_rob_col, _rob_label), (_bhar_col, "BHAR_30d")]:
+                if _mc in _grp.columns:
+                    _v = _grp[_mc].dropna()
+                    _row[f"Ø {_ml[:14]}"] = _v.mean() if len(_v) else np.nan
+                    _row[f"Std {_ml[:14]}"] = _v.std() if len(_v) else np.nan
+            _stat_rows.append(_row)
     if _stat_rows:
         _df_stat = pd.DataFrame(_stat_rows)
-        _fmt_stat = {c: "{:+.4f}" for c in ["Ø AR", "Median AR", "Std AR", "Min AR", "Max AR"]}
+        _num_cols_stat = [c for c in _df_stat.columns if c not in ("Dimension", "Score", "n")]
         st.dataframe(
-            _df_stat.style.format(_fmt_stat),
+            _df_stat.style.format({c: "{:+.4f}" for c in _num_cols_stat}, na_rep="—"),
             use_container_width=True, hide_index=True,
             height=58 + len(_df_stat) * 35,
         )
 
-    # ── Rohdaten-Tabelle ──────────────────────────────────────────────────────
+    # ── Rohdaten ──────────────────────────────────────────────────────────────
     divider("Rohdaten")
-    _show_cols = [c for c in [
-        "Unternehmen", "Sektor", "Revenue Score", "Operational Score",
-        "Combined Score", "Confidence", "AR", "Z-Score", "Return 24.02.", "Notizen",
+    _car_display_cols = [c for c in [
+        "CAR[-1,+1]", "t[-1,+1]", "CAR[-3,+3]", "t[-3,+3]",
+        "CAR[-1,+1]_mm", "t[-1,+1]_mm", "CAR[-3,+3]_mm", "t[-3,+3]_mm",
+        "BHAR_30d", "CR_30d", "AR", "Z-Score", "Return 24.02.",
+        "alpha", "beta",
     ] if c in _df_merged.columns]
-    _df_raw_disp = _df_merged[_show_cols].sort_values("AR")
-    _fmt_raw = {"AR": "{:+.4f}", "Z-Score": "{:.2f}", "Return 24.02.": "{:+.4f}"}
-    _grad_raw = [c for c in ["AR", "Z-Score"] if c in _df_raw_disp.columns]
+    _base_cols = [c for c in ["Unternehmen", "Sektor", "Revenue Score", "Operational Score",
+                               "Combined Score", "Confidence", "Notizen"]
+                  if c in _df_merged.columns]
+    _show_cols = _base_cols + _car_display_cols
+    _df_raw_disp = _df_merged[_show_cols].sort_values(_car_col if _car_col in _df_merged.columns else _show_cols[0])
+    _fmt_raw = {c: "{:+.4f}" for c in _car_display_cols if c not in ("alpha", "beta")}
+    _fmt_raw.update({"alpha": "{:+.5f}", "beta": "{:.4f}"})
+    _grad_raw = [c for c in [_car_col, "AR"] if c in _df_raw_disp.columns]
     st.dataframe(
         _df_raw_disp.style
             .format(_fmt_raw, na_rep="—")
@@ -1759,22 +2028,25 @@ with tab_thesis:
     divider("Excel-Export")
     _thesis_buf = io.BytesIO()
     with pd.ExcelWriter(_thesis_buf, engine="openpyxl") as _xw:
-        _df_merged.reset_index().rename(columns={"index": "Ticker"}).to_excel(
-            _xw, sheet_name="Rohdaten", index=False
-        )
+        # Sheet 1: Rohdaten (all metrics)
+        _df_merged.reset_index().to_excel(_xw, sheet_name="Rohdaten", index=False)
+        # Sheet 2: Deskriptive Statistik
         if _stat_rows:
             _df_stat.to_excel(_xw, sheet_name="Deskriptive Statistik", index=False)
-        for _sc_col in ["Revenue Score", "Operational Score"]:
-            _gdf = (
-                _df_plot.groupby(_sc_col)["AR"]
-                .agg(["mean", "std", "sem", "count", "min", "max"])
-                .reset_index()
-            )
-            _gdf.to_excel(
-                _xw,
-                sheet_name=f"Gruppe {'Rev' if 'Rev' in _sc_col else 'Op'}",
-                index=False,
-            )
+        # Sheet 3+4: Gruppen pro Score-Typ
+        for _sc_col, _sh in [("Revenue Score", "Gruppe Rev"), ("Operational Score", "Gruppe Op")]:
+            if _car_col in _df_plot.columns:
+                _gdf = (
+                    _df_plot.dropna(subset=[_sc_col, _car_col])
+                    .groupby(_sc_col)[_car_col]
+                    .agg(["mean", "std", "sem", "count", "min", "max"])
+                    .reset_index()
+                )
+                _gdf.to_excel(_xw, sheet_name=_sh, index=False)
+        # Sheet 5: Scores + Justifications (audit trail)
+        _full_sc = load_scores()
+        if not _full_sc.empty:
+            _full_sc.to_excel(_xw, sheet_name="Scores & Audit", index=False)
 
     _today_th = date.today()
     excel_export_card(
@@ -1782,5 +2054,5 @@ with tab_thesis:
         f"thesis_analyse_{_today_th}.xlsx",
         len(_df_merged),
         _today_th, _today_th,
-        "Rohdaten · Deskriptive Statistik · Gruppen Revenue · Gruppen Operational",
+        "Rohdaten · Deskriptive Statistik · Gruppen Rev/Op · Scores & Audit Trail",
     )
