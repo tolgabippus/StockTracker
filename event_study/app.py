@@ -1497,7 +1497,7 @@ with tab_screen:
 
     # ── Steuerung ─────────────────────────────────────────────────────────────
     divider("Steuerung")
-    _ctrl1, _ctrl2, _ctrl3 = st.columns([1, 1, 1])
+    _ctrl1, _ctrl2 = st.columns([1, 1])
     with _ctrl1:
         _active = st.session_state.get("screening_active", False)
         if st.button("⏸ Pausieren" if _active else "▶ Starten",
@@ -1510,9 +1510,7 @@ with tab_screen:
                 _SCREENING_PATH.unlink()
             st.session_state["screening_active"] = False
             st.rerun()
-    with _ctrl3:
-        _batch_sz = st.selectbox("Batch-Größe", [5, 10, 20, 50],
-                                  index=1, label_visibility="visible", key="screen_batch")
+    _batch_sz = 50
 
     # Progress
     st.progress(_n_done / _n_total if _n_total else 0)
