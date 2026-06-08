@@ -362,6 +362,9 @@ EVENT_DATE        = pd.Timestamp("2022-02-24")
 EVENT_STR         = "2022-02-24"
 _BENCHMARK_TICKER = "EXSA.DE"   # iShares STOXX Europe 600 ETF — market proxy
 
+_SCORE_COLORS = {0: "#9CA3AF", 1: "#2563EB", 2: "#F59E0B", 3: "#DC2626"}
+_SCORE_LABELS = {0: "0 – Keine", 1: "1 – Gering", 2: "2 – Moderat", 3: "3 – Kritisch"}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data helpers
@@ -1613,6 +1616,126 @@ with tab_screen:
         )
         st.caption(f"{len(_df_filtered)} Unternehmen mit {_sc_type} ≥ {_min_sc}")
 
+        # ── Schnell-Visualisierung: Screening-Scores vs. CAR ─────────────────
+        divider("Vorschau: Screening-Scores vs. CAR[−1,+1]")
+        st.caption(
+            "Erste Plausibilitätsprüfung der Hypothese mit den gefilterten Unternehmen. "
+            "Berechnet CAR[−1,+1] (Mean-Adjusted) für alle Firmen in der Tabelle oben."
+        )
+        _sc_tickers = tuple(_df_filtered["AI Ticker"].dropna().str.strip().unique().tolist())
+        if len(_sc_tickers) >= 4:
+            if st.button("CAR berechnen & plotten", type="primary", key="sc_plot_btn"):
+                calc_ar_thesis.clear()
+                st.session_state["sc_car_ready"] = True
+
+            if st.session_state.get("sc_car_ready"):
+                with st.spinner(f"Lade Preisdaten für {len(_sc_tickers)} Unternehmen …"):
+                    _sc_ar = calc_ar_thesis(_sc_tickers)
+
+                if not _sc_ar.empty:
+                    _sc_m = (_df_filtered.set_index("AI Ticker")
+                             .join(_sc_ar[["CAR[-1,+1]", "CAR[-3,+3]", "BHAR_30d"]], how="inner"))
+                    for _c in ["Rev Score", "Op Score"]:
+                        _sc_m[_c] = pd.to_numeric(_sc_m[_c], errors="coerce")
+
+                    def _sc_scatter(df, score_col, y_col, title):
+                        _d = df.dropna(subset=[score_col, y_col])
+                        if len(_d) < 4:
+                            return go.Figure()
+                        rng = np.random.default_rng(42)
+                        x_j = _d[score_col].astype(float) + rng.uniform(-0.12, 0.12, len(_d))
+                        y_p = _d[y_col] * 100
+                        pt_c = [_SCORE_COLORS.get(int(s), "#9CA3AF")
+                                for s in _d[score_col].fillna(0).astype(int)]
+                        hover = [
+                            f"<b>{idx}</b><br>{row.get('Company','')}<br>"
+                            f"{score_col}: {int(row[score_col])}<br>"
+                            f"{y_col}: {row[y_col]*100:+.2f}%"
+                            for idx, row in _d.iterrows()
+                        ]
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=x_j, y=y_p, mode="markers",
+                            marker=dict(color=pt_c, size=9, opacity=0.8,
+                                        line=dict(color="white", width=1.2)),
+                            text=hover, hoverinfo="text", showlegend=False,
+                        ))
+                        if len(_d) <= 60:
+                            fig.add_trace(go.Scatter(
+                                x=x_j, y=y_p, mode="text",
+                                text=_d.index.tolist(),
+                                textposition="top center",
+                                textfont=dict(size=7, color="#9CA3AF"),
+                                hoverinfo="skip", showlegend=False,
+                            ))
+                        _xv, _yv = _d[score_col].astype(float).values, y_p.values
+                        _mk = ~(np.isnan(_xv) | np.isnan(_yv))
+                        if _mk.sum() >= 4 and len(np.unique(_xv[_mk])) >= 2:
+                            _cf  = np.polyfit(_xv[_mk], _yv[_mk], 1)
+                            _xr  = np.linspace(_xv[_mk].min(), _xv[_mk].max(), 60)
+                            _ss_res = np.sum((_yv[_mk] - np.polyval(_cf, _xv[_mk])) ** 2)
+                            _ss_tot = np.sum((_yv[_mk] - _yv[_mk].mean()) ** 2)
+                            _r2  = 1 - _ss_res / _ss_tot if _ss_tot > 0 else 0
+                            _r   = np.corrcoef(_xv[_mk], _yv[_mk])[0, 1]
+                            fig.add_trace(go.Scatter(
+                                x=_xr, y=np.polyval(_cf, _xr), mode="lines",
+                                line=dict(color="#94A3B8", dash="dash", width=1.5),
+                                name=f"OLS  r={_r:+.3f}  R²={_r2:.3f}  β={_cf[0]:+.2f}  n={_mk.sum()}",
+                                showlegend=True,
+                            ))
+                        fig.add_hline(y=0, line_color="#E5E7EB", line_width=1)
+                        fig.update_layout(
+                            height=400, margin=dict(l=0, r=0, t=36, b=0),
+                            title=dict(text=title, font=dict(size=13, color="#374151")),
+                            xaxis=dict(title="Screening Score", tickvals=[0,1,2,3],
+                                       ticktext=[_SCORE_LABELS[i] for i in range(4)],
+                                       gridcolor="#F3F4F6", zeroline=False, range=[-0.5, 3.5],
+                                       tickfont=dict(size=10, color="#6B7280")),
+                            yaxis=dict(title=f"{y_col} (%)", tickformat=".1f",
+                                       gridcolor="#F3F4F6", zeroline=False,
+                                       tickfont=dict(size=11, color="#6B7280")),
+                            plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+                            legend=dict(orientation="h", y=1.06, x=1, xanchor="right",
+                                        font=dict(size=10, color="#6B7280")),
+                        )
+                        return fig
+
+                    _vp1, _vp2 = st.columns(2)
+                    with _vp1:
+                        st.plotly_chart(
+                            _sc_scatter(_sc_m, "Rev Score", "CAR[-1,+1]",
+                                        "Revenue Score vs. CAR[−1,+1]"),
+                            use_container_width=True,
+                        )
+                    with _vp2:
+                        st.plotly_chart(
+                            _sc_scatter(_sc_m, "Op Score", "CAR[-1,+1]",
+                                        "Operational Score vs. CAR[−1,+1]"),
+                            use_container_width=True,
+                        )
+                    _vp3, _vp4 = st.columns(2)
+                    with _vp3:
+                        st.plotly_chart(
+                            _sc_scatter(_sc_m, "Rev Score", "CAR[-3,+3]",
+                                        "Revenue Score vs. CAR[−3,+3]  (Robustness)"),
+                            use_container_width=True,
+                        )
+                    with _vp4:
+                        st.plotly_chart(
+                            _sc_scatter(_sc_m, "Op Score", "BHAR_30d",
+                                        "Operational Score vs. BHAR(30d)"),
+                            use_container_width=True,
+                        )
+                    _n_plot = len(_sc_m.dropna(subset=["CAR[-1,+1]"]))
+                    st.caption(
+                        f"{_n_plot} Unternehmen mit CAR-Daten · Mean-Adjusted Model · "
+                        f"Schätzfenster 120 Tage · Benchmark {_BENCHMARK_TICKER}"
+                    )
+                else:
+                    st.warning("Keine Preisdaten geladen — Ticker prüfen.")
+        else:
+            st.caption("Mindestens 4 Unternehmen in der gefilterten Tabelle benötigt.")
+
         # ── Zur Russland-Analyse hinzufügen ───────────────────────────────────
         divider("Shortlist → Russland-Analyse")
         _exposed   = _df_filtered[_df_filtered["Max Score"].fillna(0) >= 1].copy()
@@ -2095,9 +2218,7 @@ with tab_thesis:
         st.warning("Keine verwertbaren Daten. Bitte erst 'CAR / BHAR berechnen' klicken.")
         st.stop()
 
-    # ── Scatter helper ────────────────────────────────────────────────────────
-    _SCORE_COLORS = {0: "#9CA3AF", 1: "#2563EB", 2: "#F59E0B", 3: "#DC2626"}
-    _SCORE_LABELS = {0: "0 – Keine", 1: "1 – Gering", 2: "2 – Signifikant", 3: "3 – Kritisch"}
+    # _SCORE_COLORS / _SCORE_LABELS defined at module level
 
     def _make_scatter(df: pd.DataFrame, score_col: str, y_col: str, y_label: str, title: str) -> go.Figure:
         _df_s = df.dropna(subset=[score_col, y_col])
