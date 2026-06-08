@@ -3,6 +3,8 @@
 
 # Data / output
 data/stoxx600_full_tickers.json
+data/screening_results.json
+data/russia_scores.json
 output/
 __pycache__/
 *.pyc

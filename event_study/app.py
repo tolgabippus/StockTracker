@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -31,9 +32,10 @@ import yfinance as yf
 import data.constituents as _constituents_mod
 from data.constituents import STOXX50_TICKERS
 
-ROOT         = Path(__file__).resolve().parent
-_FULL_JSON   = ROOT / "data" / "stoxx600_full_tickers.json"
-_SCORES_PATH = ROOT / "data" / "russia_scores.json"
+ROOT              = Path(__file__).resolve().parent
+_FULL_JSON        = ROOT / "data" / "stoxx600_full_tickers.json"
+_SCORES_PATH      = ROOT / "data" / "russia_scores.json"
+_SCREENING_PATH   = ROOT / "data" / "screening_results.json"
 
 
 def _get_stoxx600() -> list[str]:
@@ -513,6 +515,84 @@ def save_scores(df: pd.DataFrame) -> None:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-Screening helpers
+# ─────────────────────────────────────────────────────────────────────────────
+_SCREEN_SYS = """\
+You are a financial screening assistant. Quickly assess pre-war Russian market exposure for a European large-cap company (before 24 February 2022).
+
+Respond ONLY in this exact machine-readable format — no other text whatsoever:
+
+COMPANY: [full company name]
+REVENUE_SCORE: [0|1|2|3]
+OPERATIONAL_SCORE: [0|1|2|3]
+REASON: [max 15 words explaining key Russia connection, or "No identifiable Russia exposure"]
+TICKER: [confirmed yfinance ticker or UNKNOWN]
+
+Scoring:
+  Revenue:     0 = <1%   1 = 1-5%   2 = 5-10%   3 = >10% of total revenue from Russia
+  Operational: 0 = none  1 = limited 2 = significant  3 = critical presence in Russia
+
+Rules: Conservative scoring — when uncertain score lower. If company is unknown from the ticker, return all scores as 0.\
+"""
+
+
+def load_screening() -> pd.DataFrame:
+    _empty = pd.DataFrame({
+        "Ticker":    pd.Series(dtype=str),
+        "Company":   pd.Series(dtype=str),
+        "Rev Score": pd.Series(dtype=object),
+        "Op Score":  pd.Series(dtype=object),
+        "Reason":    pd.Series(dtype=str),
+        "AI Ticker": pd.Series(dtype=str),
+    })
+    if not _SCREENING_PATH.exists():
+        return _empty
+    try:
+        return pd.DataFrame(json.loads(_SCREENING_PATH.read_text()))
+    except Exception:
+        return _empty
+
+
+def save_screening(df: pd.DataFrame) -> None:
+    _SCREENING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _SCREENING_PATH.write_text(
+        json.dumps(df.to_dict(orient="records"), indent=2, ensure_ascii=False)
+    )
+
+
+def run_quick_screen(api_key: str, ticker: str) -> str:
+    client = _OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    resp = client.chat.completions.create(
+        model="deepseek-chat",
+        max_tokens=120,
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": _SCREEN_SYS},
+            {"role": "user", "content": f"Screen company with yfinance ticker: {ticker}"},
+        ],
+    )
+    return resp.choices[0].message.content
+
+
+def parse_screen_result(text: str, ticker: str) -> dict:
+    def _get(pattern, default=""):
+        m = re.search(pattern, text, re.IGNORECASE)
+        return m.group(1).strip() if m else default
+
+    rev = _get(r'REVENUE_SCORE:\s*([0-3])')
+    ops = _get(r'OPERATIONAL_SCORE:\s*([0-3])')
+    ai_t = _get(r'TICKER:\s*([A-Z0-9][A-Z0-9.\-]{0,19})')
+    return {
+        "Ticker":    ticker,
+        "Company":   _get(r'COMPANY:\s*(.+)'),
+        "Rev Score": int(rev) if rev else None,
+        "Op Score":  int(ops) if ops else None,
+        "Reason":    _get(r'REASON:\s*(.+)'),
+        "AI Ticker": ai_t if ai_t and ai_t.upper() != "UNKNOWN" else ticker,
+    }
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def calc_ar_thesis(tickers: tuple[str, ...]) -> pd.DataFrame:
     """Compute AR/CAR using Mean-Adjusted and Market Model; CAR[-1,+1], [-3,+3], 30-day."""
@@ -874,8 +954,8 @@ with _hdr_r:
 # ─────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────────────────────────────────────
-tab_markt, tab_aktien, tab_russia, tab_thesis = st.tabs(
-    ["Indizes", "Einzelaktien", "Russland-Analyse", "Thesis-Analyse"]
+tab_markt, tab_aktien, tab_screen, tab_russia, tab_thesis = st.tabs(
+    ["Indizes", "Einzelaktien", "Pre-Screening", "Russland-Analyse", "Thesis-Analyse"]
 )
 
 
@@ -1377,7 +1457,229 @@ with tab_aktien:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 3 — RUSSLAND-ANALYSE
+# TAB 3 — PRE-SCREENING
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_screen:
+
+    st.markdown(
+        "<div style='background:#F0FDF4;border:1px solid #BBF7D0;border-radius:10px;"
+        "padding:0.85rem 1.1rem;margin-bottom:1.25rem'>"
+        "<div style='font-size:0.84rem;font-weight:600;color:#166534'>"
+        "Phase 1 — Schnell-Screening aller STOXX 600 Unternehmen</div>"
+        "<div style='font-size:0.78rem;color:#15803D;margin-top:3px;line-height:1.5'>"
+        "Minimale KI-Abfrage (~$0.06 für alle 600) identifiziert Unternehmen mit russischer "
+        "Exposition. Nur diese kommen in die vollständige Russland-Analyse (Audit Trail, Justification)."
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── API Key ──────────────────────────────────────────────────────────────
+    _sc_env_key = os.environ.get("DEEPSEEK_API_KEY", "") or st.secrets.get("DEEPSEEK_API_KEY", "")
+    if not _sc_env_key:
+        with st.expander("DeepSeek API Key", expanded=True):
+            _sc_key_in = st.text_input("Key", type="password",
+                                        placeholder="sk-...", label_visibility="collapsed",
+                                        key="sc_key")
+        _sc_api_key = _sc_key_in.strip()
+    else:
+        _sc_api_key = _sc_env_key
+
+    if not _OPENAI_OK or not _sc_api_key:
+        st.info("Bitte DeepSeek API Key eingeben.")
+        st.stop()
+
+    # ── State & Daten ─────────────────────────────────────────────────────────
+    _df_screen = load_screening()
+    _done_set  = set(_df_screen["Ticker"].tolist()) if not _df_screen.empty else set()
+    _n_total   = len(STOXX600_TICKERS)
+    _n_done    = len(_done_set)
+    _n_todo    = _n_total - _n_done
+
+    # ── Steuerung ─────────────────────────────────────────────────────────────
+    divider("Steuerung")
+    _ctrl1, _ctrl2, _ctrl3 = st.columns([1, 1, 1])
+    with _ctrl1:
+        _active = st.session_state.get("screening_active", False)
+        if st.button("⏸ Pausieren" if _active else "▶ Starten",
+                     type="primary", use_container_width=True, key="screen_toggle"):
+            st.session_state["screening_active"] = not _active
+            st.rerun()
+    with _ctrl2:
+        if st.button("Reset", use_container_width=True, key="screen_reset"):
+            if _SCREENING_PATH.exists():
+                _SCREENING_PATH.unlink()
+            st.session_state["screening_active"] = False
+            st.rerun()
+    with _ctrl3:
+        _batch_sz = st.selectbox("Batch-Größe", [5, 10, 20, 50],
+                                  index=1, label_visibility="visible", key="screen_batch")
+
+    # Progress
+    st.progress(_n_done / _n_total if _n_total else 0)
+    st.caption(
+        f"{_n_done} / {_n_total} gescreent · {_n_todo} verbleibend · "
+        f"Geschätzte Restkosten: ~${_n_todo * 0.0001:.2f}"
+    )
+
+    # ── Processing loop ───────────────────────────────────────────────────────
+    if st.session_state.get("screening_active") and _n_todo > 0:
+        _todo_tickers = [t for t in STOXX600_TICKERS if t not in _done_set]
+        _batch        = _todo_tickers[:_batch_sz]
+        _status_ph    = st.empty()
+        _new_rows     = []
+
+        for _i, _tk in enumerate(_batch):
+            _status_ph.markdown(
+                f"<span style='font-size:0.8rem;color:#6B7280'>"
+                f"Analysiere <b>{_tk}</b> &nbsp;·&nbsp; {_n_done + _i + 1} / {_n_total}</span>",
+                unsafe_allow_html=True,
+            )
+            try:
+                _raw = run_quick_screen(_sc_api_key, _tk)
+                _row = parse_screen_result(_raw, _tk)
+            except Exception as _exc:
+                _row = {"Ticker": _tk, "Company": "", "Rev Score": None,
+                        "Op Score": None, "Reason": f"Fehler: {_exc}", "AI Ticker": _tk}
+            _new_rows.append(_row)
+            time.sleep(0.35)   # rate-limit buffer
+
+        _combined = pd.concat([_df_screen, pd.DataFrame(_new_rows)], ignore_index=True)
+        save_screening(_combined)
+        _status_ph.empty()
+        st.rerun()
+
+    elif st.session_state.get("screening_active") and _n_todo == 0:
+        st.session_state["screening_active"] = False
+        st.success(f"Screening abgeschlossen — {_n_total} Unternehmen gescreent.")
+
+    # ── Ergebnisse ────────────────────────────────────────────────────────────
+    if _df_screen.empty:
+        st.markdown(
+            "<p style='color:#9CA3AF;font-size:0.875rem;margin-top:1rem'>"
+            "Noch keine Ergebnisse. Screening starten.</p>",
+            unsafe_allow_html=True,
+        )
+    else:
+        # Numeric scores
+        _df_sc2 = _df_screen.copy()
+        for _c in ["Rev Score", "Op Score"]:
+            _df_sc2[_c] = pd.to_numeric(_df_sc2[_c], errors="coerce")
+        _df_sc2["Combined"] = _df_sc2["Rev Score"].fillna(0) + _df_sc2["Op Score"].fillna(0)
+        _df_sc2["Max Score"] = _df_sc2[["Rev Score", "Op Score"]].max(axis=1)
+
+        # KPI summary
+        divider("Überblick")
+        _kk1, _kk2, _kk3, _kk4 = st.columns(4)
+        _n_any  = int((_df_sc2["Max Score"].fillna(0) >= 1).sum())
+        _n_mod  = int((_df_sc2["Max Score"].fillna(0) >= 2).sum())
+        _n_high = int((_df_sc2["Max Score"].fillna(0) == 3).sum())
+        _kk1.metric("Gescreent",   f"{_n_done} / {_n_total}")
+        _kk2.metric("Score ≥ 1",   _n_any,  help="Mindestens geringe Exposition")
+        _kk3.metric("Score ≥ 2",   _n_mod,  help="Moderate oder kritische Exposition")
+        _kk4.metric("Score = 3",   _n_high, help="Kritische Exposition")
+
+        # Filter
+        divider("Ergebnisse filtern")
+        _fc1, _fc2 = st.columns([1, 2])
+        with _fc1:
+            _min_sc = st.selectbox(
+                "Mind. Score anzeigen",
+                options=[0, 1, 2, 3],
+                index=1,
+                format_func=lambda x: {0: "Alle", 1: "≥ 1 (gering+)", 2: "≥ 2 (moderat+)", 3: "= 3 (kritisch)"}[x],
+                key="sc_min",
+            )
+        with _fc2:
+            _sc_type = st.radio(
+                "Basierend auf",
+                ["Max Score", "Rev Score", "Op Score", "Combined"],
+                horizontal=True, label_visibility="visible", key="sc_type",
+            )
+
+        _df_filtered = _df_sc2[_df_sc2[_sc_type].fillna(-1) >= _min_sc].copy()
+        _df_display  = (_df_filtered[["Ticker", "Company", "Rev Score", "Op Score",
+                                       "Max Score", "Combined", "Reason", "AI Ticker"]]
+                        .sort_values("Combined", ascending=False))
+
+        # Score color map for display
+        _SC_COLOR_MAP = {0: "#9CA3AF", 1: "#3B82F6", 2: "#F59E0B", 3: "#DC2626"}
+
+        st.dataframe(
+            _df_display.style.background_gradient(
+                subset=["Rev Score", "Op Score", "Max Score", "Combined"],
+                cmap="RdYlGn", vmin=0, vmax=6,
+            ).format({"Rev Score": "{:.0f}", "Op Score": "{:.0f}",
+                       "Max Score": "{:.0f}", "Combined": "{:.0f}"}, na_rep="—"),
+            use_container_width=True,
+            height=min(600, 58 + len(_df_display) * 35),
+        )
+        st.caption(f"{len(_df_filtered)} Unternehmen mit {_sc_type} ≥ {_min_sc}")
+
+        # ── Zur Russland-Analyse hinzufügen ───────────────────────────────────
+        divider("Shortlist → Russland-Analyse")
+        _exposed   = _df_filtered[_df_filtered["Max Score"].fillna(0) >= 1].copy()
+        _t2name    = dict(zip(_exposed["AI Ticker"], _exposed["Company"]))
+        if not _exposed.empty:
+            _sel = st.multiselect(
+                "Unternehmen für vollständige Analyse auswählen",
+                options=_exposed["AI Ticker"].tolist(),
+                default=[],
+                format_func=lambda t: f"{t}  —  {_t2name.get(t, '')}",
+                label_visibility="collapsed",
+                key="sc_sel",
+            )
+            _add_col, _info_col = st.columns([2, 3])
+            with _add_col:
+                if _sel and st.button("Ausgewählte zur Russland-Analyse hinzufügen",
+                                       type="primary", use_container_width=True, key="sc_add"):
+                    _ex = load_scores()
+                    _added = 0
+                    for _t in _sel:
+                        if _t in _ex["Ticker"].values:
+                            continue
+                        _r = _exposed[_exposed["AI Ticker"] == _t].iloc[0]
+                        _ex = pd.concat([_ex, pd.DataFrame([{
+                            "Ticker":                    _t,
+                            "Unternehmen":               _r.get("Company", ""),
+                            "Sektor":                    "",
+                            "Revenue Score":             int(_r["Rev Score"]) if pd.notna(_r["Rev Score"]) else 0,
+                            "Revenue Evidence":          "",
+                            "Revenue Justification":     "",
+                            "Operational Score":         int(_r["Op Score"])  if pd.notna(_r["Op Score"])  else 0,
+                            "Operational Evidence":      "",
+                            "Operational Justification": "",
+                            "Confidence":                "Low",
+                            "Audit Trail":               f"Pre-Screening: {_r.get('Reason', '')}",
+                            "Notizen":                   "[Pre-Screen only — Vollanalyse ausstehend]",
+                        }])], ignore_index=True)
+                        _added += 1
+                    save_scores(_ex)
+                    st.toast(f"{_added} Unternehmen hinzugefügt → Russland-Analyse Tab.", icon="✅")
+            with _info_col:
+                if _sel:
+                    st.caption(
+                        f"{len(_sel)} ausgewählt · bereits vorhandene werden übersprungen · "
+                        f"Scores als 'Low Confidence' vorbelegt — im Russland-Tab vollständig analysieren"
+                    )
+
+        # ── Export ────────────────────────────────────────────────────────────
+        divider("Export")
+        _sc_buf = io.BytesIO()
+        with pd.ExcelWriter(_sc_buf, engine="openpyxl") as _scw:
+            _df_sc2.sort_values("Combined", ascending=False).to_excel(
+                _scw, sheet_name="Alle Ergebnisse", index=False)
+            _df_sc2[_df_sc2["Max Score"].fillna(0) >= 1].sort_values(
+                "Combined", ascending=False).to_excel(
+                _scw, sheet_name="Shortlist Score≥1", index=False)
+        excel_export_card(
+            _sc_buf, f"prescreening_{date.today()}.xlsx",
+            _n_done, date.today(), date.today(),
+            "Alle Ergebnisse · Shortlist Score≥1",
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 4 — RUSSLAND-ANALYSE
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_russia:
 
